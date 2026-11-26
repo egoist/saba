@@ -54,6 +54,7 @@ func TestInstallScript(t *testing.T) {
 	}
 	const asset = "saba-linux-amd64"
 	good := "#!/bin/sh\necho saba v9.9.9\n"
+	latest := "#!/bin/sh\necho saba v10.0.0\n"
 	sum := func(s string) string {
 		h := sha256.Sum256([]byte(s))
 		return hex.EncodeToString(h[:])
@@ -67,9 +68,16 @@ func TestInstallScript(t *testing.T) {
 		"/download/v1.0.0/" + asset:      "#!/bin/sh\necho tampered\n",
 		"/download/v1.0.0/checksums.txt": sum(good) + "  " + asset + "\n",
 		// not an executable at all, and no checksum file
-		"/download/v2.0.0/" + asset: "<html>not a binary</html>",
-		// latest, without a checksum file
-		"/latest/download/" + asset: "#!/bin/sh\necho saba v10.0.0\n",
+		"/download/v2.0.0/" + asset:      "<html>not a binary</html>",
+		"/download/v2.0.0/checksums.txt": sum("<html>not a binary</html>") + "  " + asset + "\n",
+		// a release without checksums
+		"/download/v4.0.0/" + asset: latest,
+		// latest, with checksums
+		"/latest/download/" + asset:      latest,
+		"/latest/download/checksums.txt": sum(latest) + "  " + asset + "\n",
+		// a release whose checksums do not list the binary
+		"/download/v3.0.0/" + asset:      latest,
+		"/download/v3.0.0/checksums.txt": sum(latest) + "  saba-darwin-arm64\n",
 	}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body, ok := files[r.URL.Path]
@@ -115,7 +123,18 @@ func TestInstallScript(t *testing.T) {
 		t.Fatalf("a failed install replaced the working binary with %q", installed())
 	}
 
-	// Releases without a checksum file still install; "latest" uses its own URL.
+	// Verification is not optional: no checksums, or no entry, means no install.
+	if out, err := run("v4.0.0"); err == nil || !strings.Contains(out, "could not download the release checksums") {
+		t.Fatalf("a release without checksums must not install: %v\n%s", err, out)
+	}
+	if out, err := run("v3.0.0"); err == nil || !strings.Contains(out, "do not list") {
+		t.Fatalf("a binary missing from the checksums must not install: %v\n%s", err, out)
+	}
+	if installed() != good {
+		t.Fatalf("a refused install replaced the working binary")
+	}
+
+	// "latest" uses its own URL.
 	if out, err := run(""); err != nil {
 		t.Fatalf("latest install failed: %v\n%s", err, out)
 	}

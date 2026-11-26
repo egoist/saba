@@ -46,8 +46,9 @@ func (e *Engine) Deploy(name string, req api.DeployRequest, contextDir string) (
 	}
 
 	// IfLive requests may turn into no-deploy ones; decide that up front.
+	// An app that does not exist yet has nothing running either.
 	if req.IfLive && !req.NoDeploy {
-		if a, err := e.Store.App(name); err == nil && (a.Current() == nil || a.Stopped) {
+		if a, err := e.Store.App(name); err != nil || a.Current() == nil || a.Stopped {
 			req.NoDeploy = true
 		}
 	}
@@ -110,16 +111,22 @@ func (e *Engine) Deploy(name string, req api.DeployRequest, contextDir string) (
 	return run, nil, nil
 }
 
-// Cancel aborts the deployment in progress for an app.
-func (e *Engine) Cancel(app string) error {
+// Cancel aborts the deployment in progress for an app and returns its
+// version. A deployment that already switched traffic finishes anyway: from
+// that point the new version is serving and undoing it is a rollback.
+func (e *Engine) Cancel(app string) (int, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	r := e.busy[app]
-	if r == nil || r.cancel == nil {
-		return api.Errorf(api.CodeConflict, "no deployment is in progress for %q", app)
+	switch {
+	case r == nil:
+		return 0, api.Errorf(api.CodeConflict, "no deployment is in progress for %q", app)
+	case r.cancel == nil:
+		return 0, api.Errorf(api.CodeConflict, "%q is being stopped, started or destroyed, which cannot be canceled", app).
+			WithHint("Wait a moment and check `saba status -a %s`.", app)
 	}
 	r.cancel()
-	return nil
+	return r.Version, nil
 }
 
 // prepare validates a deploy request against the state and records its
@@ -134,9 +141,14 @@ func (e *Engine) prepare(st *store.State, name string, req *api.DeployRequest) (
 	src := req.Source
 	a := st.Apps[name]
 
+	isNew := a == nil
 	if a == nil {
-		switch src.Type {
-		case "upload", "git", "image":
+		// Settings saved before the first deploy (`saba env set` on a new
+		// app) create the app without starting it.
+		saving := src.Type == "current" && req.NoDeploy && !req.DryRun &&
+			(len(req.EnvSet) > 0 || len(req.AddDomains) > 0 || len(req.Config) > 0)
+		switch {
+		case src.Type == "upload", src.Type == "git", src.Type == "image", saving:
 		default:
 			return nil, nil, nil, store.NotFound(name)
 		}
@@ -156,6 +168,10 @@ func (e *Engine) prepare(st *store.State, name string, req *api.DeployRequest) (
 	}
 	if req.IfLive && (a.Current() == nil || a.Stopped) {
 		req.NoDeploy = true
+	}
+	if a.Kind == api.KindDatabase && (src.Type == "upload" || src.Type == "git") {
+		return nil, nil, nil, api.Errorf(api.CodeInvalid, "%q is a database; it cannot be built from source", name).
+			WithHint("Deploy an image of its engine instead, e.g. `saba deploy -a %s --image postgres:17`, or change settings with `saba db publish`.", name)
 	}
 
 	// Work on copies; nothing is written to the app until the end.
@@ -309,7 +325,10 @@ func (e *Engine) prepare(st *store.State, name string, req *api.DeployRequest) (
 		a.Config, a.Env = cfg, env
 		a.PendingChanges = pending(a)
 		msg := "saved; takes effect on the next deploy"
-		if a.PendingChanges {
+		switch {
+		case isNew:
+			msg = fmt.Sprintf("created app %q with these settings, without starting it; `saba deploy -a %s` starts it", name, name)
+		case a.PendingChanges:
 			msg = fmt.Sprintf("saved; apply it with `saba restart -a %s`", name)
 		}
 		return nil, []string{msg}, urls, nil
@@ -473,10 +492,21 @@ func (e *Engine) runDeploy(ctx context.Context, r *Run, contextDir string) {
 
 	if err != nil {
 		ae := api.AsError(err)
-		if ctx.Err() != nil {
-			ae = api.Errorf(api.CodeDeployFailed, "deployment v%d was canceled or timed out", r.Version)
+		switch ctx.Err() {
+		case context.Canceled:
+			ae = api.Errorf(api.CodeDeployFailed, "deployment v%d was canceled", r.Version).
+				WithHint("The previous version keeps serving. Nothing else changed.").WithDetail("cause", "canceled")
+		case context.DeadlineExceeded:
+			ae = api.Errorf(api.CodeDeployFailed, "deployment v%d timed out after %s", r.Version, deployTimeout).
+				WithHint("The previous version keeps serving. Look at `saba logs --deployment v%d` for the step that hung.", r.Version).WithDetail("cause", "timeout")
 		}
-		if ae.Code == api.CodeInternal {
+		// Whatever stopped it, a deployment that ran and failed is a failed
+		// deployment (exit code 5): the previous version is still serving.
+		// The specific cause stays available in details.
+		switch ae.Code {
+		case api.CodeBuildFailed, api.CodeReleaseFailed, api.CodeUnhealthy, api.CodeDeployFailed:
+		default:
+			ae.WithDetail("cause", ae.Code)
 			ae.Code = api.CodeDeployFailed
 		}
 		cctx, cancel := bg(ctx, 2*time.Minute)

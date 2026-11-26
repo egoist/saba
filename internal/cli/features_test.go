@@ -194,10 +194,14 @@ func TestNodesCertsAndSecretsThroughTheCLI(t *testing.T) {
 
 // fakeS3 is a minimal in-memory S3 endpoint: enough of the API for saba's
 // backup mirroring, without signature checks.
+// fakeS3PutsFail makes the fake S3 endpoint reject uploads.
+var fakeS3PutsFail bool
+
 func fakeS3(t *testing.T) (endpoint string, objects func() []string) {
 	t.Helper()
 	var mu sync.Mutex
 	store := map[string][]byte{}
+	fakeS3PutsFail = false
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		mu.Lock()
 		defer mu.Unlock()
@@ -218,6 +222,10 @@ func fakeS3(t *testing.T) (endpoint string, objects func() []string) {
 			b.WriteString("</ListBucketResult>")
 			io.WriteString(w, b.String())
 		case r.Method == http.MethodPut:
+			if fakeS3PutsFail {
+				http.Error(w, "<Error><Code>InternalError</Code><Message>disk full</Message></Error>", http.StatusInternalServerError)
+				return
+			}
 			store[key], _ = io.ReadAll(r.Body)
 		case r.Method == http.MethodGet:
 			v, ok := store[key]
@@ -296,8 +304,27 @@ func TestBackupsToS3ThroughTheCLI(t *testing.T) {
 		t.Fatalf("doctor should report the mirror: %s", out)
 	}
 
+	// A backup whose upload failed keeps doctor failing until it is in the
+	// bucket, even once S3 answers again.
+	fakeS3PutsFail = true
+	_, out, _ = saba("db", "backup", "create", "main", "--json")
+	fakeS3PutsFail = false
+	if !strings.Contains(out, `"location": "local"`) || !strings.Contains(out, "upload to S3 failed") {
+		t.Fatalf("backup during an upload outage: %s", out)
+	}
+	if code, out, _ = saba("doctor", "--json"); code == 0 || !strings.Contains(out, "exist only on this server") {
+		t.Fatalf("doctor must report the local-only backup: %d %s", code, out)
+	}
+	saba("db", "backup", "s3", "set", "--bucket", "bucket", "--endpoint", endpoint, "--prefix", "prod", "--json")
+	for i := 0; i < 50 && len(objects()) < 2; i++ {
+		time.Sleep(20 * time.Millisecond) // the catch-up upload runs in the background
+	}
+	if code, out, _ = saba("doctor", "--json"); code != 0 {
+		t.Fatalf("doctor after the catch-up: %d %s", code, out)
+	}
+
 	// Deleting a backup removes it from the bucket as well.
-	if code, _, errOut = saba("db", "backup", "delete", "main", b.ID, "--yes", "--json"); code != 0 || len(objects()) != 0 {
+	if code, _, errOut = saba("db", "backup", "delete", "main", b.ID, "--yes", "--json"); code != 0 || len(objects()) != 1 {
 		t.Fatalf("delete: %s, bucket %v", errOut, objects())
 	}
 	if code, _, _ = saba("db", "backup", "s3", "remove", "--json"); code != 0 {
@@ -320,5 +347,137 @@ func TestDirectNodeValidation(t *testing.T) {
 		if code != api.ExitUsage || errorCode(t, errOut) != api.CodeInvalid {
 			t.Errorf("%s: exit %d %s", name, code, errOut)
 		}
+	}
+}
+
+// Settings can be given to an app before its first deploy: env set, domains
+// add and db link create it without starting it.
+func TestSettingsBeforeTheFirstDeploy(t *testing.T) {
+	startDaemon(t)
+	saba("db", "create", "main", "--engine", "postgres", "--json")
+
+	code, out, errOut := saba("env", "set", "-a", "api", "SECRET=s", "--json")
+	var res api.DeployResult
+	mustJSON(t, out, &res)
+	if code != 0 || res.Deployed || !res.Saved || !strings.Contains(strings.Join(res.Plan, " "), "without starting it") {
+		t.Fatalf("env set on a new app: %d %s %s", code, out, errOut)
+	}
+	if code, _, errOut = saba("db", "link", "main", "-a", "api", "--json"); code != 0 {
+		t.Fatalf("db link on a new app: %s", errOut)
+	}
+	if code, _, errOut = saba("domains", "add", "-a", "api", "api.example.com", "--json"); code != 0 {
+		t.Fatalf("domains add on a new app: %s", errOut)
+	}
+	_, out, _ = saba("status", "api", "--json")
+	var app api.App
+	mustJSON(t, out, &app)
+	if app.Status != api.AppCreated || len(app.Containers) != 0 || app.Config.Domains[0] != "api.example.com" {
+		t.Fatalf("the app must exist without running: %s", out)
+	}
+
+	// Removing things from an app that does not exist is still an error.
+	if code, _, _ = saba("env", "unset", "-a", "ghost", "X", "--json"); code != api.ExitNotFound {
+		t.Fatalf("env unset on a missing app: %d", code)
+	}
+	// A reference to something that does not exist is rejected, and creates nothing.
+	if code, _, _ = saba("env", "set", "-a", "typo", "DB=${{nope.URL}}", "--json"); code != api.ExitUsage {
+		t.Fatalf("bad reference: %d", code)
+	}
+	if code, _, _ = saba("status", "typo", "--json"); code != api.ExitNotFound {
+		t.Fatal("a rejected change must not create the app")
+	}
+
+	// The first deploy starts it with everything saved so far.
+	if code, _, errOut = saba("deploy", "-a", "api", "--image", "ok:1", "--json"); code != 0 {
+		t.Fatalf("first deploy: %s", errOut)
+	}
+	_, out, _ = saba("env", "list", "-a", "api", "--json")
+	var env api.EnvResponse
+	mustJSON(t, out, &env)
+	if env.Env["SECRET"] != "s" || !strings.HasPrefix(env.Resolved["DATABASE_URL"], "postgres://postgres:") {
+		t.Fatalf("env after the first deploy: %+v", env)
+	}
+	if _, out, _ = saba("status", "api", "--json"); !strings.Contains(out, "https://api.example.com") && !strings.Contains(out, "http://api.example.com") {
+		t.Fatalf("domain after the first deploy: %s", out)
+	}
+}
+
+func TestCancelPublishAndListFlags(t *testing.T) {
+	startDaemon(t)
+	saba("deploy", "-a", "web", "--image", "ok:1", "--domain", "web.example.com", "--json")
+
+	// Nothing to cancel.
+	if code, _, errOut := saba("cancel", "web", "--json"); code != api.ExitConflict {
+		t.Fatalf("cancel with nothing running: %d %s", code, errOut)
+	}
+	// A deployment that would wait for its health check for a long time.
+	if code, _, errOut := saba("deploy", "-a", "web", "--image", "silent:1", "--health-path", "/", "-d", "--json"); code != 0 {
+		t.Fatalf("detached deploy: %s", errOut)
+	}
+	saba("deploy", "-a", "web", "--image", "silent:1", "--json") // must be rejected meanwhile
+	code, out, errOut := saba("cancel", "web", "--json")
+	var c cancelResult
+	mustJSON(t, out, &c)
+	if code != 0 || !c.Canceled || c.Version != 2 || c.Status != "failed" {
+		t.Fatalf("cancel: %d %s %s", code, out, errOut)
+	}
+	_, out, _ = saba("deployments", "web", "--json")
+	var deps []api.Deployment
+	mustJSON(t, out, &deps)
+	if deps[0].Version != 2 || deps[0].Status != api.StatusFailed || !strings.Contains(deps[0].Error.Message, "canceled") || deps[1].Status != api.StatusLive {
+		t.Fatalf("after cancel: %s", out)
+	}
+	if _, out, _ = saba("status", "web", "--json"); !strings.Contains(out, `"status": "running"`) {
+		t.Fatalf("the previous version must keep running: %s", out)
+	}
+
+	// --publish sets the list; a single empty value clears a list flag.
+	code, out, errOut = saba("deploy", "-a", "web", "--image", "ok:1", "--publish", "127.0.0.1:19999:8080", "--json")
+	var res api.DeployResult
+	mustJSON(t, out, &res)
+	if code != 0 || len(res.Deployment.Config.Publish) != 1 || res.Deployment.Config.EffectiveStrategy() != api.StrategyRecreate {
+		t.Fatalf("--publish: %d %s %s", code, out, errOut)
+	}
+	code, out, errOut = saba("deploy", "-a", "web", "--image", "ok:1", "--publish=", "--domain=", "--json")
+	res = api.DeployResult{}
+	mustJSON(t, out, &res)
+	if code != 0 || len(res.Deployment.Config.Publish) != 0 || len(res.Deployment.Config.Domains) != 0 || res.URLs[0] != "http://web.apps.test" {
+		t.Fatalf("clearing lists: %d %s %s", code, out, errOut)
+	}
+
+	// Databases: publish, show, clear; never built from source.
+	saba("db", "create", "main", "--engine", "postgres", "--json")
+	if code, _, errOut = saba("db", "publish", "main", "127.0.0.1:5432:5432", "--json"); code != 0 {
+		t.Fatalf("db publish: %s", errOut)
+	}
+	if _, out, _ = saba("db", "publish", "main", "--json"); !strings.Contains(out, "127.0.0.1:5432:5432") {
+		t.Fatalf("db publish (show): %s", out)
+	}
+	saba("db", "publish", "main", "--clear", "--json")
+	if _, out, _ = saba("db", "publish", "main", "--json"); !strings.Contains(out, `"publish": []`) {
+		t.Fatalf("db publish --clear: %s", out)
+	}
+	if code, _, _ = saba("db", "publish", "web", "1.2.3.4:80:80", "--json"); code != api.ExitUsage {
+		t.Fatalf("db publish on an app: %d", code)
+	}
+	os.WriteFile("index.html", []byte("hi"), 0o644)
+	if code, _, errOut = saba("deploy", "-a", "main", "--json"); code != api.ExitUsage || !strings.Contains(errOut, "is a database") {
+		t.Fatalf("building a database from source must be refused: %d %s", code, errOut)
+	}
+}
+
+func TestDurationsAsBareNumbersInSabaToml(t *testing.T) {
+	startDaemon(t)
+	os.WriteFile("index.html", []byte("hi"), 0o644)
+	os.WriteFile("saba.toml", []byte("name = \"site\"\ndrain_timeout = 45\nstop_timeout = 5\n\n[health]\ntimeout = 90\n"), 0o644)
+	code, out, errOut := saba("deploy", "--json")
+	if code != 0 {
+		t.Fatalf("deploy: %s", errOut)
+	}
+	var res api.DeployResult
+	mustJSON(t, out, &res)
+	cfg := res.Deployment.Config
+	if cfg.DrainTimeout != "45" || cfg.StopTimeout != "5" || cfg.Health.Timeout != "90" {
+		t.Fatalf("durations: %+v %+v", cfg, cfg.Health)
 	}
 }

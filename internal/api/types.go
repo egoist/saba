@@ -93,7 +93,7 @@ type HealthConfig struct {
 	Command string `json:"command,omitempty"`
 	// Timeout is the total time a new version has to become healthy (default 60s).
 	Timeout string `json:"timeout,omitempty"`
-	// Interval between attempts (default 1s).
+	// Interval between attempts (default 500ms).
 	Interval string `json:"interval,omitempty"`
 }
 

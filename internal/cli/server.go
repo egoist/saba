@@ -3,6 +3,7 @@ package cli
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -57,9 +58,9 @@ func releaseAsset(base, tag, file string) string {
 }
 
 // installScript is the shell script run on the server to download a release
-// binary to dest. The binary is verified against the release's checksums and
-// must run before it replaces the current one, so a bad download never takes
-// a working installation down.
+// binary to dest. The binary must match the release's checksums and must run
+// before it replaces the current one, so a bad or tampered download never
+// takes a working installation down.
 func installScript(dest, url, sumsURL, asset string) string {
 	q := shellwords.Quote
 	return strings.Join([]string{
@@ -67,11 +68,12 @@ func installScript(dest, url, sumsURL, asset string) string {
 		`get() { if command -v curl >/dev/null 2>&1; then curl -fsSL "$1"; elif command -v wget >/dev/null 2>&1; then wget -qO- "$1"; else echo "neither curl nor wget is installed" >&2; return 1; fi; }`,
 		"new=" + q(dest+".new"),
 		"get " + q(url) + ` > "$new" || { echo "could not download ` + url + `" >&2; exit 1; }`,
-		"if command -v sha256sum >/dev/null 2>&1 && sums=$(get " + q(sumsURL) + " 2>/dev/null); then",
-		`  want=$(printf '%s\n' "$sums" | awk -v f=` + q(asset) + ` '$2 == f { print $1 }')`,
-		`  got=$(sha256sum "$new" | awk '{ print $1 }')`,
-		`  if [ -n "$want" ] && [ "$want" != "$got" ]; then echo "checksum mismatch for ` + asset + `" >&2; exit 1; fi`,
-		"fi",
+		`command -v sha256sum >/dev/null 2>&1 || { echo "sha256sum is required to verify the download" >&2; exit 1; }`,
+		"sums=$(get " + q(sumsURL) + `) || { echo "could not download the release checksums" >&2; exit 1; }`,
+		`want=$(printf '%s\n' "$sums" | awk -v f=` + q(asset) + ` '$2 == f { print $1 }')`,
+		`[ -n "$want" ] || { echo "the release checksums do not list ` + asset + `" >&2; exit 1; }`,
+		`got=$(sha256sum "$new" | awk '{ print $1 }')`,
+		`[ "$want" = "$got" ] || { echo "checksum mismatch for ` + asset + `" >&2; exit 1; }`,
 		`chmod 755 "$new"`,
 		`"$new" --version >/dev/null || { echo "the downloaded file is not a working saba binary" >&2; exit 1; }`,
 		`mv -f "$new" ` + q(dest),
@@ -509,6 +511,17 @@ func (c *CLI) setup(ctx context.Context, target string, f *setupFlags) error {
 			WithHint("Inspect it on the server: `journalctl -u saba -n 50`.")
 	}
 
+	if sudo != "" {
+		// The CLI reaches the daemon through its socket, which is open to root
+		// and the docker group. This user has passwordless sudo, so membership
+		// grants nothing new, and it lets every later command work without sudo.
+		if _, err := ssh(`getent group docker >/dev/null && sudo -n usermod -aG docker "$(id -un)"`, nil, false); err != nil {
+			fmt.Fprintf(c.stderr, "  %s could not add the SSH user to the docker group: %v\n", ui.yellow("!"), err)
+		}
+		// Group changes apply to new logins only; drop the shared connection.
+		client.CloseMaster(target)
+	}
+
 	step("Waiting for the daemon")
 	cl := client.New(client.Target{Name: target, SSH: target})
 	defer cl.Close()
@@ -827,7 +840,12 @@ func (c *CLI) dialStdioCmd() *cobra.Command {
 			}
 			conn, err := net.Dial("unix", socket)
 			if err != nil {
-				fmt.Fprintf(os.Stderr, "saba daemon is not running or not accessible at %s: %v\n", socket, err)
+				// The CLI on the other end of SSH matches these messages to give the right hint.
+				if errors.Is(err, os.ErrPermission) {
+					fmt.Fprintf(os.Stderr, "saba: permission denied on %s: this user must be root or a member of the docker group\n", socket)
+				} else {
+					fmt.Fprintf(os.Stderr, "saba: the daemon is not running (cannot connect to %s: %v)\n", socket, err)
+				}
 				return exitError{1}
 			}
 			defer conn.Close()

@@ -59,10 +59,26 @@ func (d *Daemon) handleDoctor(w http.ResponseWriter, r *http.Request) error {
 	}
 
 	if s3cfg := st.Server.BackupS3; s3cfg != nil {
-		if msg := d.engine.RemoteBackupError(); msg != "" {
+		localOnly := 0
+		for _, name := range st.AppNames() {
+			if st.Apps[name].Kind != api.KindDatabase {
+				continue
+			}
+			list, _ := d.engine.Backups(ctx, name)
+			for _, b := range list {
+				if b.Location == "local" {
+					localOnly++
+				}
+			}
+		}
+		switch msg := d.engine.RemoteBackupError(); {
+		case msg != "":
 			add("backup-storage", false, "The last S3 operation failed: "+msg,
 				"Backups made since are stored on this server only. Check the settings with `saba db backup s3 show`; setting them again uploads what is missing.")
-		} else {
+		case localOnly > 0:
+			add("backup-storage", false, fmt.Sprintf("%d backup(s) exist only on this server and are not in S3 yet", localOnly),
+				"They are uploaded automatically within the hour. To upload them now, run `saba db backup s3 set` again with the same settings.")
+		default:
 			add("backup-storage", true, "Backups are mirrored to s3://"+s3cfg.Bucket+"/"+s3cfg.Prefix, "")
 		}
 	}

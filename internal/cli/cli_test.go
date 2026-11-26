@@ -303,6 +303,26 @@ WORKERS = 4
 		t.Fatalf("env from saba.toml: %s", out)
 	}
 
+	// Deploying this directory under another name (a preview environment)
+	// applies the file; here its domain then conflicts with the real app.
+	if code, _, errOut = saba("deploy", "-a", "site-preview", "--json"); code != api.ExitConflict || !strings.Contains(errOut, "site.example.com") {
+		t.Fatalf("preview deploy should apply saba.toml: %d %s", code, errOut)
+	}
+	if code, out, errOut = saba("deploy", "-a", "site-preview", "--domain", "preview.example.com", "--json"); code != 0 || !strings.Contains(out, `"replicas": 2`) {
+		t.Fatalf("preview deploy with its own domain: %d %s %s", code, out, errOut)
+	}
+
+	// Deploying an image as another app from this directory must not apply this file.
+	code, out, errOut = saba("deploy", "-a", "other", "--image", "ok:1", "--json")
+	var other api.DeployResult
+	mustJSON(t, out, &other)
+	if code != 0 || other.Deployment.Config.Replicas != 0 || len(other.Deployment.Config.Domains) != 0 {
+		t.Fatalf("saba.toml of %q leaked into %q: %s %s", "site", "other", out, errOut)
+	}
+	if _, out, _ = saba("env", "list", "-a", "other", "--json"); strings.Contains(out, "STAGE") {
+		t.Fatalf("[env] of another app's saba.toml was applied: %s", out)
+	}
+
 	// Flags override the file; a typo in the file is reported by name.
 	code, out, _ = saba("deploy", "--replicas", "1", "--dry-run", "--json")
 	if code != 0 || !strings.Contains(out, "start 1 replica(s)") || !strings.Contains(out, `"dry_run": true`) {

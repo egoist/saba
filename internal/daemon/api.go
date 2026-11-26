@@ -318,10 +318,11 @@ func ignore(error) error { return nil }
 
 func (d *Daemon) handleCancel(w http.ResponseWriter, r *http.Request) error {
 	name := r.PathValue("app")
-	if err := d.engine.Cancel(name); err != nil {
+	version, err := d.engine.Cancel(name)
+	if err != nil {
 		return err
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"app": name, "canceled": true})
+	writeJSON(w, http.StatusOK, map[string]any{"app": name, "version": version})
 	return nil
 }
 

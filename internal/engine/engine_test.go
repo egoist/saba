@@ -501,3 +501,18 @@ func TestReconcileRestoresRoutesAndCleansUp(t *testing.T) {
 		t.Fatalf("container of an unknown app must be left alone: %s", names)
 	}
 }
+
+// A deployment that fails for any reason after it started is reported as a
+// failed deployment (exit code 5), with the specific cause in details.
+func TestEveryDeployFailureIsADeployFailure(t *testing.T) {
+	h := newHarness(t)
+	h.mustDeploy("web", image("ok:1"))
+	_, err := h.deploy("web", image("refuse:1"))
+	var ae *api.Error
+	if !errors.As(err, &ae) || ae.Code != api.CodeDeployFailed || ae.Details["cause"] != api.CodeRuntime || ae.ExitCode() != api.ExitDeployFail {
+		t.Fatalf("got %+v", ae)
+	}
+	if _, body := h.get("web.test", "/"); body != "ok v1" {
+		t.Fatalf("previous version not serving: %q", body)
+	}
+}

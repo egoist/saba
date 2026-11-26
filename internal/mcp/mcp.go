@@ -160,6 +160,7 @@ func tools() []tool {
 				"env":             strMap("Environment variables to set."),
 				"replicas":        num("Number of containers."),
 				"nodes":           strs("Servers to spread replicas across: \"local\", node names from saba_nodes, or \"*\" for all."),
+				"publish":         strs("Host ports to expose, e.g. [\"127.0.0.1:5432:5432\"] (replaces the list; [] clears it)."),
 				"health_path":     str("HTTP path that must return 2xx/3xx before traffic is switched."),
 				"release_command": str("Command run to completion before the new version gets traffic (e.g. migrations)."),
 				"message":         str("Note to attach to the deployment."),
@@ -187,6 +188,14 @@ func tools() []tool {
 				}
 				for _, n := range getStrs(in, "nodes") {
 					args = append(args, "--node", n)
+				}
+				if v, ok := in["publish"].([]any); ok {
+					if len(v) == 0 {
+						args = append(args, "--publish=")
+					}
+					for _, p := range getStrs(in, "publish") {
+						args = append(args, "--publish", p)
+					}
 				}
 				for _, kv := range getMap(in, "env") {
 					args = append(args, "--env", kv)
@@ -226,6 +235,14 @@ func tools() []tool {
 			Description: "Deployment history of an app, newest first, including which versions can be rolled back to.",
 			Props:       schema{"app": str(appDesc)}, Required: []string{"app"},
 			Args: appArgs("deployments"),
+		},
+		{
+			Name:        "saba_cancel",
+			Description: "Stop an app's deployment in progress. The new containers are removed and the current version keeps serving. Returns once the cleanup is done; a deployment that already switched traffic finishes anyway (then use saba_rollback).",
+			Props:       schema{"app": str(appDesc)}, Required: []string{"app"},
+			Args: func(in map[string]any) ([]string, error) {
+				return []string{"cancel", getStr(in, "app")}, nil
+			},
 		},
 		{
 			Name:        "saba_rollback",

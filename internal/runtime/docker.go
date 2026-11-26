@@ -206,8 +206,12 @@ func (d *Docker) RemoveImage(ctx context.Context, ref string) error {
 // itself if they were placed in its process environment.
 var cliEnvRe = regexp.MustCompile(`(?i)^(PATH|HOME|USER|TMPDIR|PWD|SHELL|LANG|LC_.*|DOCKER_.*|BUILDKIT_.*|BUILDX_.*|COMPOSE_.*|XDG_.*|LD_.*|SSL_CERT_.*|(HTTPS?|NO|ALL|FTP)_PROXY)$`)
 
-func (d *Docker) runArgs(o RunOptions, c *exec.Cmd) []string {
+// runArgs builds the shared `docker run` arguments. The returned cleanup
+// removes the temporary env file, if one was needed; call it once the docker
+// CLI has exited.
+func (d *Docker) runArgs(o RunOptions, c *exec.Cmd) ([]string, func(), error) {
 	var args []string
+	cleanup := func() {}
 	if o.Name != "" {
 		args = append(args, "--name", o.Name)
 	}
@@ -220,15 +224,38 @@ func (d *Docker) runArgs(o RunOptions, c *exec.Cmd) []string {
 	for _, k := range sortedKeys(o.Labels) {
 		args = append(args, "--label", k+"="+o.Labels[k])
 	}
-	// Values travel through the CLI's environment rather than argv so secrets
-	// do not show up in `ps` and may contain any bytes, including newlines.
+	// Values never appear on the command line, where `ps` would show them.
+	// Most travel through the CLI's own environment (`-e NAME`), which also
+	// allows any bytes, newlines included. Names that would change how the
+	// docker CLI itself behaves (PATH, HTTPS_PROXY, DOCKER_*, ...) go through
+	// a private env file instead.
+	var fileVars []string
 	for _, k := range sortedKeys(o.Env) {
 		if cliEnvRe.MatchString(k) {
-			args = append(args, "-e", k+"="+o.Env[k])
+			if strings.ContainsAny(o.Env[k], "\r\n") {
+				return nil, cleanup, fmt.Errorf("environment variable %s cannot contain a line break", k)
+			}
+			fileVars = append(fileVars, k+"="+o.Env[k])
 			continue
 		}
 		args = append(args, "-e", k)
 		c.Env = append(c.Env, k+"="+o.Env[k])
+	}
+	if len(fileVars) > 0 {
+		f, err := os.CreateTemp("", "saba-env-*") // mode 0600
+		if err != nil {
+			return nil, cleanup, err
+		}
+		cleanup = func() { os.Remove(f.Name()) }
+		_, werr := f.WriteString(strings.Join(fileVars, "\n") + "\n")
+		if cerr := f.Close(); werr == nil {
+			werr = cerr
+		}
+		if werr != nil {
+			cleanup()
+			return nil, func() {}, werr
+		}
+		args = append(args, "--env-file", f.Name())
 	}
 	for _, p := range o.Ports {
 		args = append(args, "-p", p)
@@ -251,7 +278,7 @@ func (d *Docker) runArgs(o RunOptions, c *exec.Cmd) []string {
 	if o.StopTimeout > 0 {
 		args = append(args, "--stop-timeout", strconv.Itoa(int(o.StopTimeout.Seconds())))
 	}
-	return args
+	return args, cleanup, nil
 }
 
 func (d *Docker) loggingDriver(ctx context.Context) string {
@@ -264,7 +291,12 @@ func (d *Docker) loggingDriver(ctx context.Context) string {
 func (d *Docker) Run(ctx context.Context, o RunOptions) (string, error) {
 	c := d.cmd(ctx)
 	args := []string{"run", "-d", "--init"}
-	args = append(args, d.runArgs(o, c)...)
+	runArgs, cleanup, err := d.runArgs(o, c)
+	if err != nil {
+		return "", err
+	}
+	defer cleanup()
+	args = append(args, runArgs...)
 	// Bound log growth where the driver supports it.
 	if drv := d.loggingDriver(ctx); drv == "json-file" || drv == "local" {
 		args = append(args, "--log-opt", "max-size=20m", "--log-opt", "max-file=3")
@@ -283,7 +315,12 @@ func (d *Docker) Run(ctx context.Context, o RunOptions) (string, error) {
 func (d *Docker) RunOnce(ctx context.Context, o RunOptions, stdout, stderr io.Writer) (int, error) {
 	c := d.cmd(ctx)
 	args := []string{"run", "--rm", "--init"}
-	args = append(args, d.runArgs(o, c)...)
+	runArgs, cleanup, err := d.runArgs(o, c)
+	if err != nil {
+		return -1, err
+	}
+	defer cleanup()
+	args = append(args, runArgs...)
 	args = append(args, o.Image)
 	args = append(args, o.Command...)
 	c.Args = append(c.Args, args...)

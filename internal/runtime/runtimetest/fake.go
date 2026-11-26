@@ -24,6 +24,7 @@ import (
 //	broken    answers 500
 //	slow      answers after 150ms (to exercise draining)
 //	silent    never listens
+//	refuse    docker refuses to create the container
 type Fake struct {
 	mu         sync.Mutex
 	containers map[string]*fakeContainer
@@ -192,6 +193,9 @@ func (f *Fake) Run(_ context.Context, o runtime.RunOptions) (string, error) {
 	behaviour, ok := f.images[o.Image]
 	if !ok {
 		return "", fmt.Errorf("no such image %s", o.Image)
+	}
+	if behaviour == "refuse" {
+		return "", fmt.Errorf("docker run: invalid mount config")
 	}
 	c := &fakeContainer{opts: o}
 	c.ID = "id-" + o.Name

@@ -75,6 +75,11 @@ func LoadProject(dir string) (*Project, error) {
 			p.Config[k] = v
 		}
 	}
+	// Durations may be written as bare numbers of seconds (drain_timeout = 30).
+	secondsToString(p.Config, "drain_timeout", "stop_timeout")
+	if h, ok := p.Config["health"].(map[string]any); ok {
+		secondsToString(h, "timeout", "interval")
+	}
 	if p.Name != "" {
 		if err := api.ValidateName(p.Name); err != nil {
 			return nil, err
@@ -123,4 +128,14 @@ func projectTemplate(name string, port int, image string) string {
 # command = "node scripts/cleanup.js"
 `)
 	return b.String()
+}
+
+// secondsToString turns integer values of the given keys into strings, the
+// form duration settings take.
+func secondsToString(m map[string]any, keys ...string) {
+	for _, k := range keys {
+		if n, ok := m[k].(int64); ok {
+			m[k] = fmt.Sprint(n)
+		}
+	}
 }

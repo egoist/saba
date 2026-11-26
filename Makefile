@@ -2,7 +2,7 @@ VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 LDFLAGS := -s -w -X github.com/egoist/saba/internal/cli.Version=$(VERSION)
 PLATFORMS := linux/amd64 linux/arm64 darwin/amd64 darwin/arm64
 
-.PHONY: build install test vet release
+.PHONY: build install test vet release docs
 
 build:
 	CGO_ENABLED=0 go build -trimpath -ldflags "$(LDFLAGS)" -o dist/saba ./cmd/saba
@@ -16,6 +16,11 @@ test:
 vet:
 	go vet ./...
 	@test -z "$$(gofmt -l .)" || (echo "gofmt needed:"; gofmt -l .; exit 1)
+
+# Regenerate docs/cli-reference.md from the command definitions. `make test`
+# fails when it is out of date.
+docs:
+	SABA_UPDATE_DOCS=1 go test ./internal/cli -run TestCLIReferenceIsUpToDate -count=1
 
 # Cross-compile the binaries attached to a release: dist/saba-<os>-<arch>
 release:

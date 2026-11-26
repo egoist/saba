@@ -136,10 +136,14 @@ var dbEngines = map[string]dbEngine{
 			return map[string]any{
 					"port":    6379,
 					"volumes": []string{"data:/data"},
-					"command": "redis-server --requirepass " + pw + " --appendonly yes",
-					"health":  map[string]any{"command": "redis-cli -a " + pw + " --no-auth-warning ping", "timeout": "60s"},
+					// The password comes from the environment, so it never appears in
+					// the stored command. exec-ing the image's entrypoint keeps its
+					// privilege drop to the redis user.
+					"command": `exec docker-entrypoint.sh redis-server --requirepass "$REDIS_PASSWORD" --appendonly yes`,
+					"health":  map[string]any{"command": "redis-cli ping | grep -q PONG", "timeout": "60s"},
 				},
-				map[string]string{},
+				// REDISCLI_AUTH lets redis-cli in the container authenticate on its own.
+				map[string]string{"REDIS_PASSWORD": pw, "REDISCLI_AUTH": pw},
 				map[string]string{"URL": fmt.Sprintf("redis://default:%s@%s:6379", pw, name),
 					"HOST": name, "PORT": "6379", "USER": "default", "PASSWORD": pw}
 		}},
@@ -351,7 +355,62 @@ deploy time, so the app never stores a copy of the credentials.`,
 	link.Flags().StringVar(&as, "as", "", "Variable name to set (default: DATABASE_URL, REDIS_URL or MONGODB_URL)")
 	link.Flags().BoolVar(&noDeploy, "no-deploy", false, "Save the variable without rolling out the app")
 
-	cmd.AddCommand(create, list, url, link)
+	var clear bool
+	publishCmd := &cobra.Command{
+		Use:   "publish <database> [host-port-spec...]",
+		Short: "Expose a database on a host port, or stop exposing it",
+		Long: `Publish a database's port on the server, for example on the loopback
+interface so you can reach it through an SSH tunnel, or on a private address
+so apps on other nodes can reach it by name. The database restarts briefly.
+
+Without a spec, the current setting is shown. --clear removes it.`,
+		Example: `  saba db publish main 127.0.0.1:5432:5432     # then: ssh -N -L 5432:127.0.0.1:5432 <server>
+  saba db publish main 10.0.0.1:5432:5432      # reachable from other nodes as "main"
+  saba db publish main --clear`,
+		Args: minArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			name, specs := args[0], args[1:]
+			cl, err := c.api()
+			if err != nil {
+				return err
+			}
+			app, err := cl.App(cmd.Context(), name)
+			if err != nil {
+				return err
+			}
+			if app.Kind != api.KindDatabase {
+				return api.Errorf(api.CodeInvalid, "%q is not a managed database", name).
+					WithHint("For apps, pass --publish to `saba deploy`, or set publish in saba.toml.")
+			}
+			if len(specs) == 0 && !clear {
+				current := app.Config.Publish
+				if current == nil {
+					current = []string{}
+				}
+				return c.result(map[string]any{"database": name, "publish": current}, func() {
+					if len(current) == 0 {
+						c.ui.printf("%s is not published; it is reachable from apps on its server only.\n", name)
+						return
+					}
+					for _, p := range current {
+						fmt.Fprintln(c.stdout, p)
+					}
+				})
+			}
+			if clear {
+				specs = []string{}
+			}
+			return c.redeploy(cmd, name, api.DeployRequest{
+				Source:  api.Source{Type: "current"},
+				Config:  map[string]any{"publish": specs},
+				Trigger: "publish",
+				Message: truncate("publish "+orDash(strings.Join(specs, ", ")), 100),
+			}, true)
+		},
+	}
+	publishCmd.Flags().BoolVar(&clear, "clear", false, "Stop publishing the database's port")
+
+	cmd.AddCommand(create, list, url, link, publishCmd)
 	cmd.AddCommand(c.dbBackupCmds()...)
 	return cmd
 }

@@ -7,9 +7,11 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/BurntSushi/toml"
 
@@ -199,6 +201,16 @@ func sshArgs(dest string, tty bool) []string {
 	return append(args, dest)
 }
 
+// CloseMaster ends the shared SSH connection to dest, if there is one, so the
+// next command logs in afresh (and picks up changed group memberships).
+func CloseMaster(dest string) {
+	args := sshArgs(dest, false)
+	argv := append(append([]string{}, args[:len(args)-1]...), "-O", "exit", args[len(args)-1])
+	cmd := exec.Command("ssh", argv...)
+	cmd.WaitDelay = 2 * time.Second
+	_ = cmd.Run()
+}
+
 // SSHCommand returns the argv for running a remote command, for callers that
 // need to hand the terminal over to ssh (interactive exec, setup).
 func SSHCommand(dest string, tty bool, remote string) []string {
@@ -221,14 +233,16 @@ func unreachable(t Target, detail string) *api.Error {
 	switch {
 	case t.Local():
 		e.WithHint("Is the daemon running? Check `systemctl status saba` (or start one with `saba daemon`). You may need to be root or in the docker group to use the socket.")
+	case strings.Contains(low, "saba: permission denied on"):
+		e.WithHint("The SSH user may not use the saba daemon. Connect as root, or add the user to the docker group: `ssh %s 'sudo usermod -aG docker $USER'`.", t.SSH)
+	case strings.Contains(low, "daemon is not running"):
+		e.WithHint("The saba daemon is not running on the server. Run `ssh %s systemctl status saba`, or `saba server setup %s` to (re)install it.", t.SSH, t.SSH)
 	case strings.Contains(low, "command not found") || strings.Contains(low, "no such file"):
 		e.WithHint("saba is not installed on the server. Install it with `saba server setup %s`.", t.SSH)
 	case strings.Contains(low, "host key verification failed"):
 		e.WithHint("The server's SSH host key is not trusted yet. Run `ssh %s true` once and accept it, or set SABA_SSH_OPTS=\"-o StrictHostKeyChecking=accept-new\".", t.SSH)
 	case strings.Contains(low, "permission denied"):
 		e.WithHint("SSH authentication failed. Check that `ssh %s` works with your key.", t.SSH)
-	case strings.Contains(low, "daemon is not running") || strings.Contains(low, "connection refused") && strings.Contains(low, "saba.sock"):
-		e.WithHint("The saba daemon is not running on the server. Run `ssh %s systemctl status saba`, or `saba server setup %s` to (re)install it.", t.SSH, t.SSH)
 	default:
 		e.WithHint("Check that `ssh %s` works and that saba is installed there (`saba server setup %s`).", t.SSH, t.SSH)
 	}

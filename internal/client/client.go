@@ -377,8 +377,12 @@ func (c *Client) Deploy(ctx context.Context, name string, req api.DeployRequest,
 	return result, nil
 }
 
-func (c *Client) Cancel(ctx context.Context, name string) error {
-	return c.json(ctx, "POST", appPath(name, "/cancel"), nil, nil, nil)
+// Cancel asks the server to abort an app's deployment and returns its version.
+func (c *Client) Cancel(ctx context.Context, name string) (int, error) {
+	var out struct {
+		Version int `json:"version"`
+	}
+	return out.Version, c.json(ctx, "POST", appPath(name, "/cancel"), nil, nil, &out)
 }
 
 func (c *Client) Stop(ctx context.Context, name string) (*api.App, error) {

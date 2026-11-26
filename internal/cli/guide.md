@@ -1,5 +1,7 @@
 # saba reference
 
+Full documentation: https://github.com/egoist/saba/tree/main/docs
+
 saba deploys apps to Linux servers you own. One binary plays two roles:
 
 - **daemon** (on the server): built-in reverse proxy with automatic HTTPS, zero-downtime
@@ -64,7 +66,10 @@ saba deploy [path]            Deploy a directory (default .), or --image <ref>, 
      --release-command C --strategy rolling|recreate --health-path /p
      --memory 512m --cpus 0.5 --volume name:/path... --dockerfile F --worker --internal
      --node local|<name>|"*" ...   servers to spread replicas across
+     --publish [ip:]host:container ...   raw host ports
+     An empty value on a repeatable flag clears the list: --domain= --publish= --volume= --node=
      -m "note" -d/--detach --dry-run -q/--quiet --events
+saba cancel [app]             Stop the deployment in progress (current version keeps serving)
 saba rollback [app] [--to vN] Redeploy a previous version (image + config + env)
 saba deployments [app]        History; ROLLBACK column = restorable
 saba init [path]              Write a commented saba.toml
@@ -87,6 +92,7 @@ saba run -- <cmd...>          In a fresh one-off container of the live image (en
 saba cron [list] | run <job>
 saba db create <name> --engine postgres|mysql|mariadb|redis|mongo [--version V]
 saba db list | url <name> | link <name> -a <app> [--as VAR]
+saba db publish <db> [spec...] | --clear     Expose a database on a host port (restarts it)
 saba db backup create <db> [-o file|dir|-] | list <db> | download <db> [id|latest] [-o ...]
 saba db backup delete <db> <id> --yes | schedule <db> [<cron>|off] [--keep N]
 saba db backup s3 [show] | set --bucket B [--endpoint URL] [--region R] [--prefix P]
@@ -191,8 +197,8 @@ deleted with `saba destroy main --yes --volumes` (after unlinking: `saba env uns
 ## Database backups
 
 Supported: postgres, mysql, mariadb, mongo (not redis). Backups are gzip-compressed dumps kept
-on the server; ids are UTC timestamps (`20261126T105124Z-manual`), `latest` is accepted wherever
-an id is.
+on the server; ids are UTC timestamps (`20261126T105124Z-manual`); `latest` works for download
+and restore (delete needs the id).
 
 ```
 saba db backup schedule main @daily --keep 14   # cron or @hourly/@daily/@weekly, UTC; "off" disables
@@ -243,6 +249,9 @@ need DNS access: `saba server config set cloudflare_api_token -` (token on stdin
 Zone:Read + DNS:Edit) or `saba server config set dns_hook /abs/path` (called as
 `<hook> present|cleanup <record-name> <value>`). saba then keeps a wildcard certificate for the
 base domain and for each `*.domain` routed to an app; `saba certs` shows status and errors.
+Without a provider, every subdomain under a wildcard route gets its own certificate on first
+request, which anyone can trigger with made-up names (rate limits): configure a provider for
+wildcard routes.
 `saba certs add --cert --key` installs your own certificate for the names it lists.
 
 ## Recipes
@@ -298,6 +307,8 @@ Event        { type: "phase"|"log"|"result"|"error", time, phase, stream, messag
   record (or a wildcard) at the server; certificates are issued on the first request.
 - `saba deploy` with no changes still builds and rolls out; `saba restart` reuses the image.
 - A stopped app is not started by env/domain changes; they are saved and apply on next deploy.
+  The same goes for an app that does not exist yet: `env set`, `domains add` and `db link`
+  create it without starting it, so secrets can be set before the first `saba deploy`.
 - Concurrent deploys of the same app are rejected with `deploy_in_progress` (exit 4).
 - A deployment keeps running on the server if the CLI disconnects; follow it with
   `saba logs --deployment latest -f`.

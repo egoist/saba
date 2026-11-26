@@ -20,7 +20,7 @@ type deployFlags struct {
 	image, git, ref     string
 	port, replicas      int
 	domains, env, vols  []string
-	nodes               []string
+	nodes, publish      []string
 	envFile             string
 	command, release    string
 	strategy            string
@@ -53,7 +53,11 @@ after it passes its health check; the old version then drains and stops. If
 anything fails, the current version keeps serving and the exit code is 5.
 
 Settings come from saba.toml (see "saba init") and can be overridden by flags.
-They are remembered by the server, so later deploys do not need to repeat them.`,
+They are remembered by the server, so later deploys do not need to repeat them.
+A list flag given once with an empty value clears the list: --domain= or --publish=.
+
+The deployment runs on the server: Ctrl-C stops watching it, "saba cancel"
+stops the deployment itself.`,
 		Example: `  saba deploy                                  # deploy the current directory
   saba deploy ./api -a api --port 8080
   saba deploy -a web --image nginx:alpine --domain example.com
@@ -87,6 +91,7 @@ They are remembered by the server, so later deploys do not need to repeat them.`
 	fl.StringVar(&f.memory, "memory", "", "Memory limit per container (e.g. 512m)")
 	fl.StringVar(&f.cpus, "cpus", "", "CPU limit per container (e.g. 0.5)")
 	fl.StringArrayVar(&f.vols, "volume", nil, "Persistent volume name:/path (repeatable; replaces the list)")
+	fl.StringArrayVar(&f.publish, "publish", nil, "Expose a port on the host, e.g. 127.0.0.1:5432:5432 (repeatable; replaces the list)")
 	fl.StringVar(&f.dockerfile, "dockerfile", "", "Path of the Dockerfile, relative to the source directory")
 	fl.BoolVar(&f.worker, "worker", false, "The app does not serve HTTP (no routing or HTTP health check)")
 	fl.BoolVar(&f.internal, "internal", false, "Reachable from other apps only, not from the internet")
@@ -131,6 +136,17 @@ func (c *CLI) deploy(cmd *cobra.Command, dir string, f *deployFlags) error {
 	if err := api.ValidateName(name); err != nil {
 		return err
 	}
+	// A directory's saba.toml describes the code in that directory. Deploying
+	// that code applies it whatever the app is called (preview environments).
+	// Deploying an image or repository under another app's name must not pick
+	// up this project's settings (e.g. `saba deploy -a db --image postgres:17`
+	// run from a project directory). The context pin applies either way.
+	ignoredProject := ""
+	elsewhere := f.image != "" || f.git != ""
+	if project != nil && project.Name != "" && project.Name != name && elsewhere {
+		ignoredProject = project.Name
+		project = nil
+	}
 
 	req := api.DeployRequest{Config: map[string]any{}, EnvSet: map[string]string{}, Message: f.message, DryRun: f.dryRun}
 	if project != nil {
@@ -159,12 +175,20 @@ func (c *CLI) deploy(cmd *cobra.Command, dir string, f *deployFlags) error {
 	}
 	set("port", "port", f.port)
 	set("replicas", "replicas", f.replicas)
-	set("node", "nodes", f.nodes)
-	set("domain", "domains", f.domains)
+	// A list flag given once with an empty value (--domain=) clears the list.
+	list := func(v []string) []string {
+		if len(v) == 1 && strings.TrimSpace(v[0]) == "" {
+			return []string{}
+		}
+		return v
+	}
+	set("node", "nodes", list(f.nodes))
+	set("domain", "domains", list(f.domains))
+	set("publish", "publish", list(f.publish))
 	set("command", "command", f.command)
 	set("release-command", "release_command", f.release)
 	set("strategy", "strategy", f.strategy)
-	set("volume", "volumes", f.vols)
+	set("volume", "volumes", list(f.vols))
 	set("worker", "worker", f.worker)
 	set("internal", "internal", f.internal)
 	sub("health-path", "health", "path", f.healthPath)
@@ -249,6 +273,9 @@ func (c *CLI) deploy(cmd *cobra.Command, dir string, f *deployFlags) error {
 		if inferred {
 			ui.note("App name taken from the directory. Pin it with `saba init` or pass -a <name>.")
 		}
+		if ignoredProject != "" {
+			ui.note("Not using %s: it configures app %q, and this deploy is not from that directory.", filepath.Join(dir, ProjectFile), ignoredProject)
+		}
 		if arc != nil {
 			ui.printf("  %s %s\n", ui.cyan(pad("upload", 8)), fmt.Sprintf("Uploading source (%s, %s)", plural(arc.Files, "file"), humanBytes(arc.Bytes)))
 		}
@@ -263,6 +290,13 @@ func (c *CLI) deploy(cmd *cobra.Command, dir string, f *deployFlags) error {
 	start := time.Now()
 	result, err := cl.Deploy(ctx, name, req, body, f.detach, r.handle)
 	if err != nil {
+		if ctx.Err() != nil {
+			// Interrupted (Ctrl-C): only this command stopped, not the deployment.
+			if !c.jsonOut {
+				newUI(c.stderr, c.noColor).note("Stopped watching. The deployment continues on the server: follow it with `saba logs -a %s --deployment latest -f`, or stop it with `saba cancel -a %s`.", name, name)
+			}
+			return ctx.Err()
+		}
 		return r.fail(err)
 	}
 	if c.jsonOut && f.events {

@@ -58,6 +58,19 @@ $ cd my-app && saba deploy
 | Upgrades | The daemon restarts without refusing or dropping requests (systemd socket activation) |
 | Multi-server | Add worker nodes over SSH; named contexts for separate environments |
 
+## Documentation
+
+The [docs](docs/README.md) cover everything in depth:
+[getting started](docs/getting-started.md) ·
+[deploying](docs/deploying.md) ·
+[configuration](docs/configuration.md) ·
+[domains and HTTPS](docs/domains-and-https.md) ·
+[databases and backups](docs/databases.md) ·
+[scaling](docs/scaling.md) ·
+[automation and AI agents](docs/automation.md) ·
+[troubleshooting](docs/troubleshooting.md) ·
+[CLI reference](docs/cli-reference.md)
+
 ## Install
 
 ```sh
@@ -124,7 +137,8 @@ saba rollback                     # something went wrong
 saba doctor                       # why is something wrong
 ```
 
-Run `saba --help`, `saba <command> --help` or `saba guide` for everything else.
+Run `saba --help`, `saba <command> --help` or `saba guide` for everything else, or read the
+[docs](docs/README.md).
 
 ## Scaling across servers
 
@@ -251,6 +265,7 @@ An [MCP](https://modelcontextprotocol.io) server exposes the same operations as 
 make build      # ./dist/saba (needs Go 1.26+)
 make test       # unit and integration tests (no Docker needed)
 make release    # cross-compiled binaries in ./dist, as attached to releases
+make docs       # regenerate docs/cli-reference.md after changing commands or flags
 ```
 
 To put an unreleased build on a server, upload it instead of downloading a release:

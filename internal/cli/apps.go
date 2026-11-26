@@ -2,6 +2,7 @@ package cli
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"os"
 	"os/exec"
@@ -784,4 +785,59 @@ func (c *CLI) interactive(cmd *cobra.Command, name string, replica int, args []s
 		return api.Errorf(api.CodeRuntime, "cannot start an interactive session: %v", err)
 	}
 	return nil
+}
+
+type cancelResult struct {
+	App      string `json:"app"`
+	Version  int    `json:"version"`
+	Canceled bool   `json:"canceled"`
+	// Status is the deployment's final status: failed (canceled) or live
+	// (it switched traffic before the cancellation arrived).
+	Status string `json:"status"`
+}
+
+func (c *CLI) cancelCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "cancel [app]",
+		Short: "Stop a deployment in progress",
+		Long: `Abort the app's running deployment: the build, release command or health
+check stops, the new containers are removed, and the current version keeps
+serving. The command waits until the cleanup is done.
+
+A deployment that has already switched traffic to the new version finishes
+anyway; undo it with "saba rollback".`,
+		Example: "  saba cancel\n  saba cancel api",
+		Args:    maxArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			name, err := c.app(first(args))
+			if err != nil {
+				return err
+			}
+			cl, err := c.api()
+			if err != nil {
+				return err
+			}
+			version, err := cl.Cancel(cmd.Context(), name)
+			if err != nil {
+				return err
+			}
+			res := cancelResult{App: name, Version: version, Status: "failed", Canceled: true}
+			// Wait for the deployment to wind down; its event log ends when it does.
+			ctx, stop := context.WithTimeout(cmd.Context(), 5*time.Minute)
+			defer stop()
+			_ = cl.DeployEvents(ctx, name, "v"+strconv.Itoa(version), true, func(ev api.Event) error {
+				if ev.Type == "result" {
+					res.Status, res.Canceled = api.StatusLive, false
+				}
+				return nil
+			})
+			return c.result(res, func() {
+				if res.Canceled {
+					c.ui.success("Deployment v%d of %s canceled; the previous version keeps serving", version, c.ui.bold(name))
+					return
+				}
+				c.ui.printf("%s v%d of %s had already switched traffic and is live. Undo it with `saba rollback -a %s`.\n", c.ui.yellow("!"), version, name, name)
+			})
+		},
+	}
 }
