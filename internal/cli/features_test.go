@@ -177,18 +177,39 @@ func TestNodesCertsAndSecretsThroughTheCLI(t *testing.T) {
 		t.Fatal("certs remove failed")
 	}
 
-	// The DNS token is write-only: it never comes back in full.
+	// DNS credentials are write-only: they never come back.
 	const token = "cf-secret-token-value-9876"
-	if code, out, errOut = saba("server", "config", "set", "cloudflare_api_token", token, "--json"); code != 0 || strings.Contains(out, token) || !strings.Contains(out, "9876") {
+	if code, out, errOut = saba("certs", "dns", "set", "cloudflare", "api_token="+token, "--json"); code != 0 || strings.Contains(out, token) || !strings.Contains(out, `"api_token": "********"`) {
 		t.Fatalf("setting the token: %d %s %s", code, out, errOut)
 	}
-	for _, args := range [][]string{{"server", "info", "--json"}, {"server", "config", "--json"}, {"server", "config"}, {"certs", "--json"}, {"doctor", "--json"}} {
+	// Other settings change without repeating the secret.
+	if code, out, errOut = saba("certs", "dns", "set", "cloudflare", "zone_token=", "--json"); code != 0 || !strings.Contains(out, `"api_token": "********"`) {
+		t.Fatalf("updating one setting: %d %s %s", code, out, errOut)
+	}
+	for _, args := range [][]string{{"server", "info", "--json"}, {"server", "config", "--json"}, {"server", "config"}, {"certs", "--json"}, {"certs", "dns"}, {"certs", "dns", "--json"}, {"doctor", "--json"}} {
 		if _, out, errOut = saba(args...); strings.Contains(out+errOut, token) {
 			t.Fatalf("%v leaks the Cloudflare token", args)
 		}
 	}
-	if code, _, _ = saba("server", "config", "set", "dns_hook", "relative/path", "--json"); code != api.ExitUsage {
-		t.Fatalf("a relative dns_hook must be rejected, exit %d", code)
+	if _, out, _ = saba("certs", "dns", "providers", "--json"); !strings.Contains(out, `"porkbun"`) || !strings.Contains(out, `"api_secret_key"`) {
+		t.Fatalf("providers: %s", out)
+	}
+	for _, args := range [][]string{
+		{"certs", "dns", "set", "nosuchdns", "x=1"},
+		{"certs", "dns", "set", "cloudflare", "nosuch=1"},
+		{"certs", "dns", "set", "cloudflare", "api_token"},
+		{"certs", "dns", "set", "hook", "path=relative/path"},
+		{"certs", "dns", "set", "hook"},
+	} {
+		if code, _, _ = saba(append(args, "--json")...); code != api.ExitUsage {
+			t.Fatalf("%v must be rejected, exit %d", args, code)
+		}
+	}
+	if code, _, _ = saba("certs", "dns", "remove", "--yes", "--json"); code != 0 {
+		t.Fatal("certs dns remove failed")
+	}
+	if _, out, _ = saba("certs", "dns", "--json"); strings.TrimSpace(out) != "{}" {
+		t.Fatalf("after remove: %s", out)
 	}
 }
 

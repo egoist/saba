@@ -41,7 +41,7 @@ The daemon is a single Go process. The code is organized as:
 | `internal/store` | The state file |
 | `internal/buildpack` | Stack detection and generated Dockerfiles |
 | `internal/cluster` | The agent, and the primary's side of agent connections |
-| `internal/certs` | Wildcard (DNS-01) issuance and the certificate store |
+| `internal/certs` | DNS providers for DNS-01 (libdns) and the store of uploaded certificates |
 | `internal/s3` | A small S3 client for backup mirroring |
 | `internal/cron` | Cron expression parsing |
 | `internal/mcp` | The MCP server |
@@ -124,10 +124,26 @@ addresses of one version's replicas, plus a counter of in-flight requests.
 
 ### TLS
 
-HTTPS uses three sources, in order: certificates in saba's store (uploaded, and wildcards issued
-through DNS-01), then certificates obtained on demand from Let's Encrypt through `autocert`. The
-on-demand path only accepts hostnames currently routed to an app; under a wildcard route that is
-every subdomain, which is why wildcard routes should have a DNS provider. ACME TLS-ALPN-01 validation handshakes always reach `autocert`.
+Certificates come from two places: uploaded certificates in saba's own store, and
+[CertMagic](https://github.com/caddyserver/certmagic), which obtains, stores and renews ACME
+certificates (in `certs/acme`). The TLS handshake consults the store first for routed hostnames,
+then CertMagic's cache; ACME TLS-ALPN-01 validation handshakes always go to CertMagic, and the
+HTTP listener hands `/.well-known/acme-challenge/` to it before redirecting to HTTPS.
+
+CertMagic runs with two configurations sharing one cache:
+
+- **On demand**: a certificate for a hostname is obtained during its first handshake, through
+  TLS-ALPN-01 or HTTP-01, answered by the proxy's own listeners. A decision function allows only
+  hostnames routed to an app, and limits subdomains matched only by a wildcard route to 10 new
+  certificates per hour per route.
+- **Wildcards**: DNS-01 only, with the configured [libdns](https://github.com/libdns) provider.
+  saba asks CertMagic to manage the wanted wildcard names (the base domain and wildcard routes),
+  recomputed whenever the routing table's hostnames change and once a minute. CertMagic obtains
+  them in the background, retries failures with backoff and renews them.
+
+A cached wildcard certificate covers its subdomains without asking the decision function, so
+on-demand issuance under a wildcard route only happens while no wildcard certificate exists.
+Changing the DNS provider builds a new wildcard configuration and cancels the old one's retries.
 
 ### Listeners and restarts
 
@@ -158,7 +174,8 @@ Once a minute, at the top of the minute (UTC), the daemon:
 
 - starts due cron jobs (skipping a job whose previous run is still going),
 - starts due database backups,
-- checks whether wildcard certificates need issuing or renewing,
+- makes sure the wanted wildcard certificates are managed (renewal itself runs inside
+  CertMagic),
 - once an hour, uploads backups that exist only on the server to S3.
 
 ## The cluster

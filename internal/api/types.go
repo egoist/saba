@@ -331,14 +331,31 @@ type ServerConfig struct {
 	// Address is the primary's address on the network shared with other
 	// nodes. Containers elsewhere use it to reach apps that publish ports here.
 	Address string `json:"address,omitempty"`
-	// CloudflareAPIToken enables wildcard certificates through the DNS-01
-	// challenge for zones hosted at Cloudflare. It is never returned in full.
-	CloudflareAPIToken string `json:"cloudflare_api_token,omitempty"`
-	// DNSHook is an executable that creates and removes DNS-01 challenge
-	// records, for other DNS hosts.
-	DNSHook string `json:"dns_hook,omitempty"`
+	// DNS is the DNS provider used for wildcard certificates (ACME DNS-01).
+	// Credentials in it are never returned.
+	DNS *DNSConfig `json:"dns,omitempty"`
 	// BackupS3 is the off-site destination database backups are mirrored to.
 	BackupS3 *S3Config `json:"backup_s3,omitempty"`
+}
+
+// DNSConfig selects a DNS provider and its settings, as listed by
+// `saba certs dns providers`.
+type DNSConfig struct {
+	Provider string            `json:"provider,omitempty"`
+	Settings map[string]string `json:"settings,omitempty"`
+}
+
+// DNSProvider is one entry of `saba certs dns providers`.
+type DNSProvider struct {
+	Name     string               `json:"name"`
+	Title    string               `json:"title"`
+	Settings []DNSProviderSetting `json:"settings"`
+}
+
+// DNSProviderSetting describes one configuration value of a DNS provider.
+type DNSProviderSetting struct {
+	Name   string `json:"name"`
+	Secret bool   `json:"secret,omitempty"`
 }
 
 // S3Config addresses a bucket on S3-compatible object storage.
@@ -363,12 +380,13 @@ type Certificate struct {
 	ID string `json:"id,omitempty"`
 	// Names are the DNS names the certificate covers.
 	Names []string `json:"names"`
-	// Source is "custom" (uploaded) or "dns" (issued through DNS-01).
+	// Source is "custom" (uploaded), "wildcard" (issued through DNS-01) or
+	// "on-demand" (issued on a hostname's first HTTPS request).
 	Source    string    `json:"source"`
 	Issuer    string    `json:"issuer,omitempty"`
 	NotBefore time.Time `json:"not_before,omitempty"`
 	NotAfter  time.Time `json:"not_after,omitempty"`
-	// Status is active, expired, pending or failed.
+	// Status is active, expired, pending, failed or skipped.
 	Status string `json:"status"`
 	Error  string `json:"error,omitempty"`
 }

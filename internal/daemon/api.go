@@ -41,6 +41,10 @@ func (d *Daemon) routes() http.Handler {
 	h("DELETE /v1/backup-storage", d.handleStorageRemove)
 
 	h("GET /v1/certs", d.handleCerts)
+	h("GET /v1/certs/dns", d.handleDNSGet)
+	h("PUT /v1/certs/dns", d.handleDNSSet)
+	h("DELETE /v1/certs/dns", d.handleDNSRemove)
+	h("GET /v1/certs/dns/providers", d.handleDNSProviders)
 	h("POST /v1/certs", d.handleCertAdd)
 	h("DELETE /v1/certs/{id}", d.handleCertRemove)
 
@@ -175,18 +179,6 @@ func (d *Daemon) handlePatchConfig(w http.ResponseWriter, r *http.Request) error
 			case "acme_email":
 				s, _ := v.(string)
 				st.Server.ACMEEmail = strings.TrimSpace(s)
-			case "cloudflare_api_token":
-				s, _ := v.(string)
-				st.Server.CloudflareAPIToken = strings.TrimSpace(s)
-			case "dns_hook":
-				s, _ := v.(string)
-				s = strings.TrimSpace(s)
-				if s != "" {
-					if info, err := os.Stat(s); err != nil || info.IsDir() || !filepath.IsAbs(s) || info.Mode()&0o111 == 0 {
-						return api.Errorf(api.CodeInvalid, "dns_hook must be the absolute path of an executable on the server")
-					}
-				}
-				st.Server.DNSHook = s
 			case "address":
 				s, _ := v.(string)
 				st.Server.Address = strings.TrimSpace(s)
@@ -198,7 +190,7 @@ func (d *Daemon) handlePatchConfig(w http.ResponseWriter, r *http.Request) error
 				st.Server.KeepVersions = int(n)
 			default:
 				return api.Errorf(api.CodeInvalid, "unknown server config key %q", k).
-					WithHint("Valid keys: base_domain, acme_email, keep_versions, address, cloudflare_api_token, dns_hook.")
+					WithHint("Valid keys: base_domain, acme_email, keep_versions, address. DNS providers are set with `saba certs dns set`.")
 			}
 		}
 		out = st.Server
@@ -208,9 +200,8 @@ func (d *Daemon) handlePatchConfig(w http.ResponseWriter, r *http.Request) error
 		return err
 	}
 	d.engine.RefreshRoutes()
-	// New DNS settings deserve an immediate attempt.
-	d.issuer.Forget()
-	go d.ensureCerts(context.WithoutCancel(r.Context()))
+	// A new base domain may need a new wildcard certificate.
+	go d.tlsm.sync(context.WithoutCancel(r.Context()))
 	writeJSON(w, http.StatusOK, redact(out))
 	return nil
 }

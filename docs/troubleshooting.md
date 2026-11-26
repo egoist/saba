@@ -146,22 +146,40 @@ Certificates are requested on the first HTTPS request for a hostname. For that t
 - ports 80 and 443 must be reachable from the internet; check the cloud provider's firewall,
 - the hostname must be routed to an app.
 
+`saba certs` lists every routed hostname with its certificate's status and, for a failed one,
+the error from Let's Encrypt; `saba doctor` reports failures too.
+
 Under a wildcard domain (`*.example.com`) without a
 [DNS provider](domains-and-https.md#wildcard-certificates), every subdomain needs its own
-certificate, issued on its first request; configure a provider instead. If a wildcard certificate
-failed, `saba certs` shows the error.
+certificate, issued on its first request and limited to 10 new subdomains per hour; configure a
+provider instead.
+
+### A wildcard certificate fails
+
+`saba certs` shows the cause. The usual ones:
+
+- **Wrong or under-privileged credentials.** Check them with `saba certs dns`, and set them again
+  with `saba certs dns set <provider> <key>=-`. A Cloudflare token needs Zone:Read and DNS:Edit
+  on the zone.
+- **`could not determine zone`.** saba finds the zone by asking DNS for its SOA record; the
+  domain must be delegated to the provider's name servers.
+- **Timed out waiting for the record.** saba waits until the TXT record is visible on the zone's
+  authoritative name servers. If the server cannot query them directly, point the daemon at a
+  resolver that can: add `--dns-resolver 1.1.1.1:53` to its command line.
+
+Failures are retried with growing intervals, and right away after `saba certs dns set`.
 
 Let's Encrypt has rate limits on certificates per domain per week; repeatedly destroying and
 recreating apps under one domain can hit them. A wildcard certificate for the base domain avoids
 per-app certificates entirely.
 
-Issuance errors during TLS handshakes are logged at debug level; enable
-[verbose logs](servers.md#the-daemon-and-systemd) to see them.
+Every issued and failed certificate is logged by the daemon (`journalctl -u saba`); with
+[verbose logs](servers.md#the-daemon-and-systemd) the ACME exchange is logged as well.
 
 ### Behind Cloudflare
 
 Use SSL mode **Full (strict)**, and install a Cloudflare origin certificate with `saba certs add`
-or configure the Cloudflare token. See [Behind Cloudflare's proxy](domains-and-https.md#behind-cloudflares-proxy).
+or configure the `cloudflare` DNS provider. See [Behind Cloudflare's proxy](domains-and-https.md#behind-cloudflares-proxy).
 
 ## Nodes
 

@@ -174,7 +174,7 @@ saba doctor
 | `disk` | The disk holding saba's data is 90% full or more |
 | `backup-storage` | The last operation against the S3 backup bucket failed |
 | `node:<name>` | A node is unreachable |
-| `cert:<name>` | A wildcard certificate could not be issued, or an uploaded one expires within two weeks |
+| `cert:<name>` | A certificate could not be issued (with Let's Encrypt's error), or an uploaded one expires within two weeks |
 | `app:<name>` | An app is crashed, degraded, or has never deployed successfully |
 | `dns:<host>` | A routed domain does not resolve (informational when it resolves elsewhere, e.g. through a CDN) |
 

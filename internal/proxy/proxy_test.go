@@ -268,3 +268,36 @@ func TestUpgradeAndStreaming(t *testing.T) {
 		t.Fatalf("rest = %q", rest)
 	}
 }
+
+func TestHostsChangedNotifications(t *testing.T) {
+	p := New(nil)
+	changed := make(chan struct{}, 10)
+	p.OnHostsChanged = func() { changed <- struct{}{} }
+	expect := func(want bool, what string) {
+		t.Helper()
+		select {
+		case <-changed:
+			if !want {
+				t.Fatalf("%s: unexpected notification", what)
+			}
+		case <-time.After(100 * time.Millisecond):
+			if want {
+				t.Fatalf("%s: no notification", what)
+			}
+		}
+	}
+	p.SetApp("web", 1, []string{"a.test"}, nil)
+	expect(true, "new app")
+	p.SetApp("web", 2, []string{"a.test"}, []string{"127.0.0.1:1"})
+	expect(false, "new version, same hosts")
+	p.SetApp("web", 2, []string{"a.test", "*.b.test"}, nil)
+	expect(true, "added domain")
+	if got := strings.Join(p.Hosts(), ","); got != "*.b.test,a.test" {
+		t.Fatalf("hosts: %s", got)
+	}
+	p.RemoveApp("web")
+	expect(true, "removed app")
+	if len(p.Hosts()) != 0 {
+		t.Fatal("hosts left after removal")
+	}
+}

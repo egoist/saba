@@ -25,8 +25,12 @@ These work with every command.
   - [`saba agent uninstall`](#saba-agent-uninstall) — Stop the agent and remove it (containers and data on the node are kept)
 - [`saba apps`](#saba-apps) — List apps on the server
 - [`saba cancel`](#saba-cancel) — Stop a deployment in progress
-- [`saba certs`](#saba-certs) — Wildcard and custom TLS certificates
+- [`saba certs`](#saba-certs) — TLS certificates: status, wildcards through DNS, your own
   - [`saba certs add`](#saba-certs-add) — Upload a certificate to use for the names it lists
+  - [`saba certs dns`](#saba-certs-dns) — Show the DNS provider used for wildcard certificates
+    - [`saba certs dns providers`](#saba-certs-dns-providers) — List supported DNS hosts and their settings
+    - [`saba certs dns remove`](#saba-certs-dns-remove) — Forget the DNS provider and its credentials
+    - [`saba certs dns set`](#saba-certs-dns-set) — Configure the DNS provider (settings are checked before saving)
   - [`saba certs list`](#saba-certs-list) — List stored and pending certificates
   - [`saba certs remove`](#saba-certs-remove) — Delete a stored certificate
 - [`saba context`](#saba-context) — Manage the servers this CLI can talk to
@@ -187,7 +191,7 @@ saba cancel api
 
 ## saba certs
 
-Wildcard and custom TLS certificates
+TLS certificates: status, wildcards through DNS, your own
 
 ```sh
 saba certs
@@ -195,18 +199,15 @@ saba certs
 
 ```text
 Every routed domain gets a Let's Encrypt certificate automatically, on its
-first request. This command is for the two cases that needs more:
+first HTTPS request, and saba renews it. `saba certs` shows them all.
 
 Wildcard certificates. Let's Encrypt only issues them through the DNS-01
 challenge, which requires access to the domain's DNS. Give saba that access
 once and it obtains and renews a wildcard certificate for the server's base
 domain and for every wildcard domain routed to an app:
 
-  saba server config set cloudflare_api_token -     # token with Zone:Read + DNS:Edit, read from stdin
-  saba server config set dns_hook /usr/local/bin/my-dns-hook    # any other DNS host
-
-  The hook is called as "<hook> present|cleanup <record-name> <value>" and
-  must create or remove that TXT record.
+  saba certs dns providers                              # supported DNS hosts and their settings
+  echo "$CF_TOKEN" | saba certs dns set cloudflare api_token=-
 
 Your own certificates. A certificate from another CA (or a Cloudflare origin
 certificate) is used for the names it lists instead of an issued one:
@@ -220,11 +221,12 @@ Aliases: `cert`, `certificates`
 
 ```sh
 saba certs
+saba certs dns set hetzner auth_api_token=-
 saba certs add --cert fullchain.pem --key privkey.pem
 saba certs remove custom-example.com --yes
 ```
 
-Subcommands: [`add`](#saba-certs-add), [`list`](#saba-certs-list), [`remove`](#saba-certs-remove)
+Subcommands: [`add`](#saba-certs-add), [`dns`](#saba-certs-dns), [`list`](#saba-certs-list), [`remove`](#saba-certs-remove)
 
 ## saba certs add
 
@@ -240,6 +242,78 @@ saba certs add --cert <file> --key <file> [flags]
 |---|---|---|
 | `--cert string` |  | PEM file with the certificate chain, leaf first |
 | `--key string` |  | PEM file with the private key |
+
+## saba certs dns
+
+Show the DNS provider used for wildcard certificates
+
+```sh
+saba certs dns
+```
+
+```text
+saba obtains wildcard certificates through the ACME DNS-01 challenge, by
+creating a TXT record at your DNS host. This configures which host and the
+credentials for it. The record is created only during issuance and removed
+right after.
+
+Credentials are stored on the server and never shown again; a value of "-"
+reads it from stdin to keep it out of shell history.
+```
+
+**Examples**
+
+```sh
+saba certs dns
+saba certs dns providers
+echo "$CF_TOKEN" | saba certs dns set cloudflare api_token=-
+saba certs dns set porkbun api_key=pk1_... api_secret_key=-
+saba certs dns set hook path=/usr/local/bin/dns-hook
+saba certs dns remove --yes
+```
+
+Subcommands: [`providers`](#saba-certs-dns-providers), [`remove`](#saba-certs-dns-remove), [`set`](#saba-certs-dns-set)
+
+## saba certs dns providers
+
+List supported DNS hosts and their settings
+
+```sh
+saba certs dns providers
+```
+
+## saba certs dns remove
+
+Forget the DNS provider and its credentials
+
+```sh
+saba certs dns remove [flags]
+```
+
+Aliases: `rm`
+
+**Flags**
+
+| Flag | Default | Description |
+|---|---|---|
+| `-y, --yes` |  | Confirm the removal |
+
+## saba certs dns set
+
+Configure the DNS provider (settings are checked before saving)
+
+```sh
+saba certs dns set <provider> [key=value...]
+```
+
+```text
+Configure the DNS provider. Settings not given keep their current value when
+the provider stays the same, so a token can be rotated alone.
+
+The hook provider runs an executable on the server for any DNS host without
+built-in support, as "<path> present|cleanup <record-name> <value>"; it must
+create or remove that TXT record and exit 0.
+```
 
 ## saba certs list
 
@@ -407,6 +481,7 @@ For local experiments, run it unprivileged:
 | `--base-domain string` |  | Base domain for app URLs; "auto" derives &lt;public-ip&gt;.sslip.io (stored on first start) |
 | `--cluster-addr string` | `:7443` | Where nodes connect when --tls is off (with TLS they use the HTTPS port) |
 | `--data-dir string` | `/var/lib/saba` | Directory for state, certificates and logs |
+| `--dns-resolver stringSlice` |  | DNS server (host:port) to check DNS-01 records with, instead of the system's; repeatable |
 | `--http string` | `:80` | HTTP listen address |
 | `--https string` | `:443` | HTTPS listen address |
 | `--socket string` | `/run/saba/saba.sock` | Unix socket for the control API |
@@ -432,6 +507,7 @@ saba daemon install [flags]
 | `--base-domain string` |  | Base domain for app URLs; "auto" derives &lt;public-ip&gt;.sslip.io (stored on first start) |
 | `--cluster-addr string` | `:7443` | Where nodes connect when --tls is off (with TLS they use the HTTPS port) |
 | `--data-dir string` | `/var/lib/saba` | Directory for state, certificates and logs |
+| `--dns-resolver stringSlice` |  | DNS server (host:port) to check DNS-01 records with, instead of the system's; repeatable |
 | `--http string` | `:80` | HTTP listen address |
 | `--https string` | `:443` | HTTPS listen address |
 | `--print-unit` |  | Print the systemd units instead of installing them |
@@ -1440,9 +1516,8 @@ Server settings:
   acme_email      contact address for Let's Encrypt (applies after a daemon restart)
   keep_versions   old versions kept per app for rollbacks (default 5)
   address         this server's address on the network shared with other nodes
-  cloudflare_api_token   enables wildcard certificates (DNS-01) for Cloudflare zones;
-                  pass "-" as the value to read it from stdin
-  dns_hook        executable that manages DNS-01 records for other DNS hosts
+
+The DNS provider for wildcard certificates is configured with `saba certs dns`.
 ```
 
 **Examples**

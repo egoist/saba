@@ -33,22 +33,24 @@ from containers on the server, and replica ports are bound to the loopback inter
 no ports at all; their agent connects out. The exception you create yourself is `publish`, which
 binds wherever you tell it to.
 
-Requests for hostnames not routed to an app get a 404 and no certificate.
+Requests for hostnames not routed to an app get a 404 and no certificate: saba never asks
+Let's Encrypt for names it does not route, so scanners cannot make it request certificates.
 
 ## Secrets
 
-Environment variables, database passwords, the Cloudflare token and the S3 secret are stored in
+Environment variables, database passwords, DNS provider credentials and the S3 secret are stored in
 `/var/lib/saba/state.json`, mode `0600`, owned by root. They are **not encrypted at rest**:
 anyone with root on the server can read them, which matches the trust model above (root can read
 any container's environment anyway).
 
 - Values are given to containers through Docker's environment, never on a command line, so they
   do not show up in `ps`.
-- `saba status`, `saba apps`, `saba deployments`, `saba server info`, `saba server config` and
-  `saba db backup s3 show` never print secrets. `saba env`, `saba db url` and the database
+- `saba status`, `saba apps`, `saba deployments`, `saba server info`, `saba server config`,
+  `saba certs dns` and `saba db backup s3 show` never print secrets. `saba env`, `saba db url` and the database
   outputs do, because that is their purpose.
-- The Cloudflare token and the S3 secret can be passed with `-` to read them from stdin, keeping
-  them out of shell history.
+- DNS credentials (`saba certs dns set cloudflare api_token=-`) and the S3 secret can be read
+  from stdin, keeping them out of shell history. Give the DNS credentials the least access that
+  works: a token limited to the zone and to DNS edits.
 - Database passwords are 128 random bits. Apps linked with `saba db link` hold a reference, not a
   copy.
 

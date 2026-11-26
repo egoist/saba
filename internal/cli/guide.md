@@ -105,7 +105,7 @@ saba server setup <user@host> [--name N] [--email E] [--base-domain D] [--instal
                               [--version vX.Y.Z]   Downloads saba from GitHub releases onto the
                               server (same version as this CLI by default). Re-run to upgrade.
 saba server info | config | config set <key> <value|-> | prune
-     keys: base_domain acme_email keep_versions address cloudflare_api_token dns_hook
+     keys: base_domain acme_email keep_versions address
 saba node [list] | add <name> [user@host] [--address IP] [--primary-address HOST] [--rejoin]
                   [--install-docker] [--binary FILE]
 saba node remove <name> --yes [--keep-agent]
@@ -252,14 +252,17 @@ connection carries Docker control and replica traffic. Nodes need Docker and no 
 
 ## Certificates
 
-Regular domains: nothing to do, a certificate is issued on the first HTTPS request. Wildcards
-need DNS access: `saba server config set cloudflare_api_token -` (token on stdin; needs
-Zone:Read + DNS:Edit) or `saba server config set dns_hook /abs/path` (called as
-`<hook> present|cleanup <record-name> <value>`). saba then keeps a wildcard certificate for the
-base domain and for each `*.domain` routed to an app; `saba certs` shows status and errors.
-Without a provider, every subdomain under a wildcard route gets its own certificate on first
-request, which anyone can trigger with made-up names (rate limits): configure a provider for
-wildcard routes.
+Regular domains: nothing to do, a certificate is issued on the first HTTPS request (status
+`pending` until then). Wildcards need DNS access through a provider:
+  saba certs dns providers                          # names and settings (* = secret)
+  saba certs dns set cloudflare api_token=-         # "-" reads the value from stdin
+  saba certs dns set hook path=/abs/path            # runs `<path> present|cleanup <record> <value>`
+  saba certs dns [--json] | saba certs dns remove --yes
+Settings are validated before saving; re-running set for the same provider keeps settings not
+given. saba then keeps a wildcard certificate for the base domain and for each `*.domain`
+routed to an app; `saba certs` shows every certificate with status and errors. Without a
+provider, subdomains under a wildcard route get their own certificates on first request, at most
+10 new ones per hour per route: configure a provider for wildcard routes.
 `saba certs add --cert --key` installs your own certificate for the names it lists.
 
 ## Recipes

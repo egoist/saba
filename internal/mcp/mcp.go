@@ -443,7 +443,7 @@ func tools() []tool {
 		},
 		{
 			Name: "saba_certs", ReadOnly: true,
-			Description: "List wildcard and custom TLS certificates with status and expiry. Regular domains get certificates automatically and are not listed.",
+			Description: "List TLS certificates (uploaded, wildcard via DNS-01, and on-demand per routed domain) with status, expiry and errors. A pending on-demand certificate is issued on the domain's first HTTPS request.",
 			Props:       schema{},
 			Args:        func(map[string]any) ([]string, error) { return []string{"certs", "list"}, nil },
 		},

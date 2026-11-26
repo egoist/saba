@@ -618,6 +618,25 @@ func (c *Client) CertRemove(ctx context.Context, id string) error {
 	return c.json(ctx, "DELETE", "/v1/certs/"+url.PathEscape(id), nil, nil, nil)
 }
 
+func (c *Client) DNS(ctx context.Context) (*api.DNSConfig, error) {
+	var out api.DNSConfig
+	return &out, c.json(ctx, "GET", "/v1/certs/dns", nil, nil, &out)
+}
+
+func (c *Client) DNSSet(ctx context.Context, cfg api.DNSConfig) (*api.DNSConfig, error) {
+	var out api.DNSConfig
+	return &out, c.json(ctx, "PUT", "/v1/certs/dns", nil, cfg, &out)
+}
+
+func (c *Client) DNSRemove(ctx context.Context) error {
+	return c.json(ctx, "DELETE", "/v1/certs/dns", nil, nil, nil)
+}
+
+func (c *Client) DNSProviders(ctx context.Context) ([]api.DNSProvider, error) {
+	var out []api.DNSProvider
+	return out, c.json(ctx, "GET", "/v1/certs/dns/providers", nil, nil, &out)
+}
+
 func (c *Client) BackupStorage(ctx context.Context) (*api.S3Config, error) {
 	var out api.S3Config
 	return &out, c.json(ctx, "GET", "/v1/backup-storage", nil, nil, &out)

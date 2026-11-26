@@ -20,7 +20,6 @@ import (
 	"time"
 
 	"github.com/egoist/saba/internal/api"
-	"github.com/egoist/saba/internal/certs"
 	"github.com/egoist/saba/internal/cluster"
 	"github.com/egoist/saba/internal/cron"
 	"github.com/egoist/saba/internal/engine"
@@ -50,6 +49,9 @@ type Options struct {
 	// ACMECAFile is an extra root certificate to trust for the ACME directory
 	// (private or test CAs).
 	ACMECAFile string
+	// DNSResolvers are the DNS servers (host:port) used to check that
+	// DNS-01 challenge records have propagated. Empty uses the system's.
+	DNSResolvers []string
 	// ClusterAddr is where agents connect when TLS is off. With TLS on they
 	// use the HTTPS port.
 	ClusterAddr string
@@ -68,8 +70,7 @@ type Daemon struct {
 	proxy   *proxy.Proxy
 	engine  *engine.Engine
 	cluster *cluster.Manager
-	certs   *certs.Store
-	issuer  *certs.Issuer
+	tlsm    *tlsManager
 	started time.Time
 
 	cronMu      sync.Mutex
@@ -143,13 +144,11 @@ func Run(ctx context.Context, opts Options) error {
 	remote := &remoteStore{}
 	d.engine.RemoteBackups = func() engine.RemoteStore { return remote.get(d.store.Snapshot().Server.BackupS3) }
 
-	acmeClient, err := acmeHTTPClient(opts.ACMECAFile)
-	if err != nil {
+	if d.tlsm, err = newTLSManager(d); err != nil {
 		return err
 	}
-	if err := d.setupCerts(acmeClient); err != nil {
-		return err
-	}
+	// A newly routed wildcard domain gets its certificate right away.
+	d.proxy.OnHostsChanged = func() { d.tlsm.sync(context.Background()) }
 
 	inherited := inheritedListeners()
 	httpL := takeListener(&inherited, opts.HTTPAddr)
@@ -163,17 +162,19 @@ func Run(ctx context.Context, opts Options) error {
 	}
 	socketActivated := httpL != nil || httpsL != nil
 
+	var tlsConf *tls.Config
+	var httpChallenge func(http.Handler) http.Handler
+	if opts.TLS == proxy.TLSAuto {
+		tlsConf, httpChallenge = d.tlsm.TLSConfig(), d.tlsm.HTTPChallenge
+	}
 	srv, err := d.proxy.Listen(proxy.ServerOptions{
 		HTTPListener:  httpL,
 		HTTPSListener: httpsL,
 		HTTPAddr:      opts.HTTPAddr,
 		HTTPSAddr:     opts.HTTPSAddr,
 		TLS:           opts.TLS,
-		CertDir:       filepath.Join(opts.DataDir, "certs"),
-		Email:         st.Snapshot().Server.ACMEEmail,
-		ACMEDirectory: opts.ACMEDirectory,
-		ACMEClient:    acmeClient,
-		Certs:         d.certs.Lookup,
+		TLSConfig:     tlsConf,
+		HTTPChallenge: httpChallenge,
 		ClusterALPN:   cluster.ALPN,
 		ClusterTLS:    d.cluster.TLSConfig(),
 		Cluster:       d.cluster.Accept,
@@ -229,7 +230,7 @@ func Run(ctx context.Context, opts Options) error {
 		}
 	}()
 	go d.cronLoop(ctx)
-	go d.ensureCerts(ctx)
+	go d.tlsm.sync(ctx)
 	if opts.Ready != nil {
 		close(opts.Ready)
 	}
@@ -374,7 +375,7 @@ func (d *Daemon) cronLoop(ctx context.Context) {
 		case <-time.After(next.Sub(now)):
 		}
 		tick := next.UTC()
-		go d.ensureCerts(ctx)
+		go d.tlsm.sync(ctx)
 		if tick.Minute() == 0 {
 			// Hourly: upload any backup that exists only on this server.
 			go func() {

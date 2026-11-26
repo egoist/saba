@@ -47,7 +47,7 @@ $ cd my-app && saba deploy
 | Rollouts | Rolling (default) or recreate; health-gated; release commands for migrations |
 | Rollbacks | `saba rollback` restores image, config and environment of a previous version |
 | HTTPS | Automatic Let's Encrypt certificates for every routed domain; instant `sslip.io` URLs |
-| Wildcards | Wildcard certificates through DNS-01 (Cloudflare built in, a hook for any other DNS host); bring your own certificates |
+| Wildcards | Wildcard certificates through DNS-01 with Cloudflare, Hetzner, NameSilo and Porkbun built in, or a script for any other DNS host; bring your own certificates |
 | Scaling | `saba scale web 3` — replicas are load-balanced by the built-in proxy, on one server or spread across several |
 | Config | Declarative `saba.toml`, or flags that the server remembers |
 | Secrets | `saba env set`, with `${{db.URL}}`-style references between apps |
@@ -191,17 +191,21 @@ and retried.
 ## Certificates
 
 Every routed domain gets a Let's Encrypt certificate on its first request, with nothing to
-configure. Wildcard certificates need the DNS-01 challenge, so saba needs access to your DNS:
+configure; certificates are managed by [CertMagic](https://github.com/caddyserver/certmagic),
+the library behind Caddy. Wildcard certificates need the DNS-01 challenge, so saba needs access
+to your DNS:
 
 ```sh
-saba server config set cloudflare_api_token -      # reads the token from stdin
+saba certs dns providers                                    # cloudflare, hetzner, namesilo, porkbun, hook
+echo "$CF_API_TOKEN" | saba certs dns set cloudflare api_token=-
 saba server config set base_domain apps.example.com
 ```
 
 saba then obtains and renews `*.apps.example.com` (new apps get HTTPS instantly, with no
-per-app issuance) and a certificate for every wildcard domain routed to an app. For other DNS
-hosts, point `dns_hook` at a script that creates and removes the TXT record. To use a
-certificate from elsewhere: `saba certs add --cert fullchain.pem --key privkey.pem`.
+per-app issuance) and a certificate for every wildcard domain routed to an app. DNS hosts without
+built-in support work through a script of your own (`saba certs dns set hook
+path=...`). To use a certificate from elsewhere: `saba certs add --cert fullchain.pem --key
+privkey.pem`. `saba certs` shows the status of every certificate.
 
 ## For AI agents
 

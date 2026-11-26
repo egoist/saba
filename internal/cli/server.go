@@ -261,9 +261,8 @@ func (c *CLI) serverCmd() *cobra.Command {
   acme_email      contact address for Let's Encrypt (applies after a daemon restart)
   keep_versions   old versions kept per app for rollbacks (default 5)
   address         this server's address on the network shared with other nodes
-  cloudflare_api_token   enables wildcard certificates (DNS-01) for Cloudflare zones;
-                  pass "-" as the value to read it from stdin
-  dns_hook        executable that manages DNS-01 records for other DNS hosts`,
+
+The DNS provider for wildcard certificates is configured with ` + "`saba certs dns`" + `.`,
 		Example: "  saba server config\n  saba server config set base_domain apps.example.com",
 		Args:    maxArgs(0),
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -276,9 +275,13 @@ func (c *CLI) serverCmd() *cobra.Command {
 				return err
 			}
 			return c.result(info.Config, func() {
-				c.ui.printf("base_domain          = %s\nacme_email           = %s\nkeep_versions        = %d\naddress              = %s\ncloudflare_api_token = %s\ndns_hook             = %s\n",
+				dns := "-"
+				if info.Config.DNS != nil && info.Config.DNS.Provider != "" {
+					dns = info.Config.DNS.Provider + " (see `saba certs dns`)"
+				}
+				c.ui.printf("base_domain   = %s\nacme_email    = %s\nkeep_versions = %d\naddress       = %s\ndns provider  = %s\n",
 					orDash(info.Config.BaseDomain), orDash(info.Config.ACMEEmail), max(info.Config.KeepVersions, 5),
-					orDash(info.Config.Address), orDash(info.Config.CloudflareAPIToken), orDash(info.Config.DNSHook))
+					orDash(info.Config.Address), dns)
 			})
 		},
 	}
@@ -290,14 +293,6 @@ func (c *CLI) serverCmd() *cobra.Command {
 				return err
 			}
 			var value any = args[1]
-			if args[1] == "-" {
-				// Secrets can be piped in instead of ending up in shell history.
-				b, err := io.ReadAll(io.LimitReader(os.Stdin, 64*1024))
-				if err != nil {
-					return err
-				}
-				value = strings.TrimSpace(string(b))
-			}
 			if args[0] == "keep_versions" {
 				n, err := strconv.Atoi(args[1])
 				if err != nil {
@@ -310,13 +305,7 @@ func (c *CLI) serverCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			return c.result(cfg, func() {
-				shown := args[1]
-				if key == "cloudflare_api_token" {
-					shown = orDash(cfg.CloudflareAPIToken)
-				}
-				c.ui.success("%s = %s", key, shown)
-			})
+			return c.result(cfg, func() { c.ui.success("%s = %s", key, args[1]) })
 		},
 	})
 
@@ -518,6 +507,7 @@ func (p prefixWriter) Write(b []byte) (int, error) {
 
 type daemonFlags struct {
 	dataDir, socket, http, https, tls, email, baseDomain, acmeDir, acmeCA, cluster string
+	dnsResolvers                                                                   []string
 }
 
 func (f *daemonFlags) register(cmd *cobra.Command) {
@@ -531,6 +521,7 @@ func (f *daemonFlags) register(cmd *cobra.Command) {
 	fl.StringVar(&f.baseDomain, "base-domain", "", "Base domain for app URLs; \"auto\" derives <public-ip>.sslip.io (stored on first start)")
 	fl.StringVar(&f.acmeDir, "acme-directory", "", "Alternative ACME directory URL (e.g. Let's Encrypt staging)")
 	fl.StringVar(&f.acmeCA, "acme-ca-file", "", "Extra root certificate to trust for the ACME directory (private or test CAs)")
+	fl.StringSliceVar(&f.dnsResolvers, "dns-resolver", nil, "DNS server (host:port) to check DNS-01 records with, instead of the system's; repeatable")
 	fl.StringVar(&f.cluster, "cluster-addr", ":7443", "Where nodes connect when --tls is off (with TLS they use the HTTPS port)")
 }
 
@@ -547,6 +538,9 @@ func (f *daemonFlags) args() []string {
 	}
 	if f.acmeCA != "" {
 		args = append(args, "--acme-ca-file", f.acmeCA)
+	}
+	for _, r := range f.dnsResolvers {
+		args = append(args, "--dns-resolver", r)
 	}
 	return args
 }
@@ -630,7 +624,7 @@ For local experiments, run it unprivileged:
 			err := daemon.Run(cmd.Context(), daemon.Options{
 				Version: Version, DataDir: f.dataDir, Socket: f.socket,
 				HTTPAddr: f.http, HTTPSAddr: f.https, TLS: f.tls,
-				ACMEEmail: f.email, BaseDomain: f.baseDomain, ACMEDirectory: f.acmeDir, ACMECAFile: f.acmeCA, ClusterAddr: f.cluster, Log: log,
+				ACMEEmail: f.email, BaseDomain: f.baseDomain, ACMEDirectory: f.acmeDir, ACMECAFile: f.acmeCA, DNSResolvers: f.dnsResolvers, ClusterAddr: f.cluster, Log: log,
 			})
 			if err != nil {
 				return api.Errorf(api.CodeRuntime, "%v", err)

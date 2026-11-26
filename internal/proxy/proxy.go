@@ -15,6 +15,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httputil"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -112,6 +113,9 @@ type Proxy struct {
 	// are reached through their agent). Failures must be *net.OpError dial
 	// errors for failover to work.
 	Dial func(ctx context.Context, network, addr string) (net.Conn, error)
+	// OnHostsChanged, if set, is called (in its own goroutine) after the set
+	// of routed hostnames changed.
+	OnHostsChanged func()
 }
 
 type ctxKey struct{}
@@ -152,6 +156,12 @@ func (p *Proxy) SetApp(name string, version int, hosts, addrs []string) *Pool {
 		r = &route{name: name}
 		p.apps[name] = r
 	}
+	old := strings.Join(r.hosts, " ")
+	defer func() {
+		if strings.Join(r.hosts, " ") != old {
+			p.hostsChanged()
+		}
+	}()
 	for _, h := range r.hosts {
 		if p.hosts[h] == r {
 			delete(p.hosts, h)
@@ -173,6 +183,9 @@ func (p *Proxy) RemoveApp(name string) *Pool {
 	r := p.apps[name]
 	if r == nil {
 		return nil
+	}
+	if len(r.hosts) > 0 {
+		p.hostsChanged()
 	}
 	for _, h := range r.hosts {
 		if p.hosts[h] == r {
@@ -249,8 +262,43 @@ func (p *Proxy) Stats(name string) (Stats, bool) {
 	return s, true
 }
 
-// HasHost reports whether a hostname is routed. It is the TLS host policy.
+func (p *Proxy) hostsChanged() {
+	if f := p.OnHostsChanged; f != nil {
+		go f()
+	}
+}
+
+// Hosts lists the routed hostnames, sorted.
+func (p *Proxy) Hosts() []string {
+	p.mu.RLock()
+	out := make([]string, 0, len(p.hosts))
+	for h := range p.hosts {
+		out = append(out, h)
+	}
+	p.mu.RUnlock()
+	sort.Strings(out)
+	return out
+}
+
+// HasHost reports whether a hostname is routed.
 func (p *Proxy) HasHost(host string) bool { return p.lookup(host) != nil }
+
+// MatchHost says how a hostname is routed: exactly, through a wildcard route
+// (which it then returns, e.g. "*.example.com"), or not at all.
+func (p *Proxy) MatchHost(host string) (exact bool, wildcard string, ok bool) {
+	host = strings.TrimSuffix(strings.ToLower(hostOnly(host)), ".")
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	if p.hosts[host] != nil {
+		return true, "", true
+	}
+	if i := strings.IndexByte(host, '.'); i > 0 {
+		if w := "*" + host[i:]; p.hosts[w] != nil {
+			return false, w, true
+		}
+	}
+	return false, "", false
+}
 
 func (p *Proxy) lookup(host string) *route {
 	host = strings.ToLower(host)

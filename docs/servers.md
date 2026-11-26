@@ -131,11 +131,10 @@ saba server config set base_domain apps.example.com
 | `acme_email` | Contact address for Let's Encrypt; applies after a daemon restart |
 | `keep_versions` | Superseded versions per app that keep their images for rollbacks (default 5) |
 | `address` | This server's address on the network shared with nodes. See [Scaling](scaling.md#talking-between-apps-on-different-servers) |
-| `cloudflare_api_token` | Enables wildcard certificates for Cloudflare zones. Pass `-` to read it from stdin |
-| `dns_hook` | Executable that manages DNS-01 records for other DNS hosts |
 
-The S3 destination for backups is set with `saba db backup s3 set`. Secrets are never printed in
-full.
+The DNS provider for wildcard certificates is set with `saba certs dns set` (see
+[Wildcard certificates](domains-and-https.md#wildcard-certificates)), and the S3 destination
+for backups with `saba db backup s3 set`. Secrets are never printed.
 
 ## The daemon and systemd
 
@@ -176,6 +175,7 @@ Environment=SABA_DEBUG=1
 | `--acme-email` | — | Seeds `acme_email` on the first start |
 | `--acme-directory` | Let's Encrypt | Another ACME CA, e.g. the Let's Encrypt staging environment |
 | `--acme-ca-file` | — | Extra root certificate to trust for a private ACME CA |
+| `--dns-resolver` | system resolvers | DNS server (`host:port`) used to check that DNS-01 records are visible; repeatable |
 | `--cluster-addr` | `:7443` | Where node agents connect when `--tls off`; with TLS they use the HTTPS port |
 
 ### Running a daemon locally
@@ -198,8 +198,8 @@ SABA_HOST=unix://$PWD/.saba/saba.sock saba status
 | `/var/lib/saba/state.json` | All state: apps, configuration, **environment variables including secrets**, deployment history, nodes, settings. Root only |
 | `/var/lib/saba/logs/<app>/v<N>.ndjson` | Deployment logs |
 | `/var/lib/saba/backups/<database>/` | Database backups |
-| `/var/lib/saba/certs/` | Issued certificates and ACME account keys |
-| `/var/lib/saba/certs/store/` | Wildcard and uploaded certificates |
+| `/var/lib/saba/certs/acme/` | Issued certificates (on-demand and wildcard), ACME account keys, OCSP staples |
+| `/var/lib/saba/certs/store/` | Uploaded certificates |
 | `/var/lib/saba/cluster/` | The primary's cluster key, which agents pin |
 | `/var/lib/saba/tmp/` | Uploads and builds in progress; emptied on start |
 

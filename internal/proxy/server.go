@@ -9,8 +9,6 @@ import (
 	"net/http"
 	"time"
 
-	"golang.org/x/crypto/acme"
-	"golang.org/x/crypto/acme/autocert"
 	"golang.org/x/net/http2"
 )
 
@@ -24,21 +22,16 @@ type ServerOptions struct {
 	HTTPAddr  string
 	HTTPSAddr string
 	TLS       string
-	// CertDir caches issued certificates.
-	CertDir string
-	// Email is the ACME account contact (optional).
-	Email string
-	// ACMEDirectory overrides the ACME endpoint (e.g. Let's Encrypt staging).
-	ACMEDirectory string
+	// TLSConfig provides certificates when TLS is on: its GetCertificate
+	// (and NextProtos, which must include ACME's "acme-tls/1").
+	TLSConfig *tls.Config
+	// HTTPChallenge wraps the plain-HTTP handler so ACME HTTP-01 challenges
+	// are answered.
+	HTTPChallenge func(http.Handler) http.Handler
 	// HTTPListener and HTTPSListener are already-bound sockets (systemd socket
 	// activation). When nil, the addresses above are bound instead.
 	HTTPListener  net.Listener
 	HTTPSListener net.Listener
-	// Certs, if set, is consulted before on-demand issuance: it returns a
-	// stored certificate (custom or wildcard) for a server name, or nil.
-	Certs func(serverName string) *tls.Certificate
-	// ACMEClient overrides the HTTP client used to talk to the CA.
-	ACMEClient *http.Client
 	// Cluster connections share the HTTPS port: TLS handshakes offering
 	// ClusterALPN get ClusterTLS and are handed to Cluster, which serves the
 	// connection until it ends.
@@ -82,42 +75,15 @@ func (p *Proxy) Listen(opts ServerOptions) (*Server, error) {
 	var httpHandler http.Handler = p
 
 	if opts.TLS == TLSAuto {
-		mgr := &autocert.Manager{
-			Prompt: autocert.AcceptTOS,
-			Cache:  autocert.DirCache(opts.CertDir),
-			Email:  opts.Email,
-			HostPolicy: func(_ context.Context, host string) error {
-				if p.HasHost(host) {
-					return nil
-				}
-				return fmt.Errorf("saba: host %q is not routed to any app", host)
-			},
-		}
-		if opts.ACMEDirectory != "" || opts.ACMEClient != nil {
-			mgr.Client = &acme.Client{DirectoryURL: opts.ACMEDirectory, HTTPClient: opts.ACMEClient}
-			if opts.ACMEDirectory == "" {
-				mgr.Client.DirectoryURL = acme.LetsEncryptURL
-			}
+		if opts.TLSConfig == nil {
+			return nil, fmt.Errorf("TLS is on but no certificate source is configured")
 		}
 		// Redirects must keep a non-standard HTTPS port.
 		if _, port, err := net.SplitHostPort(opts.HTTPSAddr); err == nil && port != "443" {
 			p.httpsPort = ":" + port
 		}
-		tlsConf := mgr.TLSConfig()
+		tlsConf := opts.TLSConfig.Clone()
 		tlsConf.MinVersion = tls.VersionTLS12
-		if opts.Certs != nil {
-			onDemand := tlsConf.GetCertificate
-			tlsConf.GetCertificate = func(hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
-				// ACME TLS-ALPN-01 validation handshakes must reach autocert.
-				alpn := len(hello.SupportedProtos) == 1 && hello.SupportedProtos[0] == acme.ALPNProto
-				if !alpn && p.HasHost(hello.ServerName) {
-					if c := opts.Certs(hello.ServerName); c != nil {
-						return c, nil
-					}
-				}
-				return onDemand(hello)
-			}
-		}
 		s.https = &http.Server{
 			Handler:           hsts(p),
 			TLSConfig:         tlsConf,
@@ -147,7 +113,10 @@ func (p *Proxy) Listen(opts ServerOptions) (*Server, error) {
 			return nil, err
 		}
 		s.tlsL = l
-		httpHandler = mgr.HTTPHandler(http.HandlerFunc(p.redirectHTTPS))
+		httpHandler = http.HandlerFunc(p.redirectHTTPS)
+		if opts.HTTPChallenge != nil {
+			httpHandler = opts.HTTPChallenge(httpHandler)
+		}
 	}
 
 	s.http = &http.Server{

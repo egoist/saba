@@ -1,20 +1,14 @@
 package certs
 
 import (
-	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/x509"
 	"crypto/x509/pkix"
-	"encoding/json"
 	"encoding/pem"
-	"io"
 	"math/big"
-	"net/http"
-	"net/http/httptest"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 
@@ -141,125 +135,5 @@ func TestStoreRejectsBadInput(t *testing.T) {
 	}
 	if len(s.List()) != 0 {
 		t.Fatal("rejected certificates must not be stored")
-	}
-}
-
-func TestDueForRenewal(t *testing.T) {
-	now := time.Now()
-	day := 24 * time.Hour
-	cases := []struct {
-		lifetime, left time.Duration
-		want           bool
-	}{
-		{90 * day, 60 * day, false},     // a fresh 90-day certificate
-		{90 * day, 29 * day, true},      // renew 30 days before expiry
-		{6 * day, 5 * day, false},       // a short-lived certificate is not renewed immediately...
-		{6 * day, 47 * time.Hour, true}, // ...but once a third of its life is left
-		{90 * day, -time.Hour, true},
-	}
-	for _, c := range cases {
-		notAfter := now.Add(c.left)
-		if got := dueForRenewal(notAfter.Add(-c.lifetime), notAfter, now); got != c.want {
-			t.Errorf("lifetime %v, %v left: due = %v, want %v", c.lifetime, c.left, got, c.want)
-		}
-	}
-}
-
-// A stand-in for the Cloudflare API that checks what saba sends.
-func TestCloudflareProvider(t *testing.T) {
-	var (
-		mu      sync.Mutex
-		records = map[string]map[string]any{}
-		calls   []string
-	)
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		mu.Lock()
-		defer mu.Unlock()
-		calls = append(calls, r.Method+" "+r.URL.RequestURI())
-		reply := func(result any) {
-			json.NewEncoder(w).Encode(map[string]any{"success": true, "result": result})
-		}
-		if r.Header.Get("Authorization") != "Bearer good-token" {
-			w.WriteHeader(http.StatusForbidden)
-			json.NewEncoder(w).Encode(map[string]any{"success": false, "errors": []map[string]any{{"code": 9109, "message": "Invalid access token"}}})
-			return
-		}
-		switch {
-		case r.Method == "GET" && r.URL.Path == "/zones":
-			if r.URL.Query().Get("name") == "example.com" {
-				reply([]map[string]string{{"id": "zone1", "name": "example.com"}})
-			} else {
-				reply([]any{})
-			}
-		case r.Method == "POST" && r.URL.Path == "/zones/zone1/dns_records":
-			var body map[string]any
-			b, _ := io.ReadAll(r.Body)
-			json.Unmarshal(b, &body)
-			records["rec1"] = body
-			reply(map[string]string{"id": "rec1"})
-		case r.Method == "DELETE" && r.URL.Path == "/zones/zone1/dns_records/rec1":
-			delete(records, "rec1")
-			reply(map[string]string{"id": "rec1"})
-		default:
-			http.NotFound(w, r)
-		}
-	}))
-	defer srv.Close()
-	ctx := context.Background()
-
-	cf := &Cloudflare{Token: "good-token", BaseURL: srv.URL}
-	cleanup, err := cf.Present(ctx, "_acme-challenge.apps.example.com", "challenge-value")
-	if err != nil {
-		t.Fatal(err)
-	}
-	rec := records["rec1"]
-	if rec == nil || rec["type"] != "TXT" || rec["name"] != "_acme-challenge.apps.example.com" || rec["content"] != "challenge-value" {
-		t.Fatalf("record created: %v", rec)
-	}
-	// The zone is found by walking up from the record name.
-	if calls[0] != "GET /zones?name=apps.example.com" || calls[1] != "GET /zones?name=example.com" {
-		t.Fatalf("zone lookup calls: %v", calls)
-	}
-	cleanup(ctx)
-	if len(records) != 0 {
-		t.Fatal("cleanup did not delete the record")
-	}
-
-	if _, err := cf.Present(ctx, "_acme-challenge.other.org", "v"); err == nil || !strings.Contains(err.Error(), "no Cloudflare zone") {
-		t.Fatalf("a domain outside the account: %v", err)
-	}
-	bad := &Cloudflare{Token: "bad", BaseURL: srv.URL}
-	if _, err := bad.Present(ctx, "_acme-challenge.example.com", "v"); err == nil || !strings.Contains(err.Error(), "check the API token") {
-		t.Fatalf("a rejected token should explain itself: %v", err)
-	}
-}
-
-func TestEnsureSkipsHealthyCertificatesAndBacksOff(t *testing.T) {
-	s, _ := Open(t.TempDir())
-	now := time.Now()
-	c, k := selfSigned(t, "ok", now.Add(-time.Hour), now.Add(80*24*time.Hour), "*.fine.test")
-	if _, err := s.Put(SourceDNS, c, k); err != nil {
-		t.Fatal(err)
-	}
-	// An unreachable CA: any attempt to issue fails fast.
-	i := &Issuer{Store: s, Dir: t.TempDir(), DirectoryURL: "http://127.0.0.1:1/dir", Log: discardLogger()}
-	i.Ensure(context.Background(), []string{"*.fine.test", "*.broken.test"}, Hook{Path: "/bin/true"})
-	f := i.Failures()
-	if _, failed := f["*.fine.test"]; failed {
-		t.Fatal("a certificate with plenty of validity left must not be re-issued")
-	}
-	first, failed := f["*.broken.test"]
-	if !failed {
-		t.Fatal("the failure should be recorded")
-	}
-	i.DirectoryURL = "http://127.0.0.1:2/dir"
-	i.Ensure(context.Background(), []string{"*.broken.test"}, Hook{Path: "/bin/true"})
-	if i.Failures()["*.broken.test"] != first {
-		t.Fatal("a recent failure must not be retried immediately")
-	}
-	i.Forget()
-	i.Ensure(context.Background(), []string{"*.broken.test"}, Hook{Path: "/bin/true"})
-	if i.Failures()["*.broken.test"] == first {
-		t.Fatal("after Forget the issuance should be retried")
 	}
 }

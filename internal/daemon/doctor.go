@@ -103,13 +103,15 @@ func (d *Daemon) handleDoctor(w http.ResponseWriter, r *http.Request) error {
 				fmt.Sprintf("Its replicas are out of rotation until it is back. On the node, check `systemctl status saba-agent` and `journalctl -u saba-agent`; the agent reconnects by itself."))
 		}
 	}
-	for name, msg := range d.issuer.Failures() {
-		add("cert:"+name, false, "Wildcard certificate could not be issued: "+msg,
-			"Check the DNS settings with `saba server config`; saba retries hourly, or immediately after a config change.")
-	}
-	for _, c := range d.certs.List() {
+	for _, c := range d.tlsm.list(ctx) {
 		left := time.Until(c.NotAfter)
 		switch {
+		case c.Status == "failed" && c.Source == "wildcard":
+			add("cert:"+c.Names[0], false, "Wildcard certificate could not be issued: "+c.Error,
+				"Check the provider settings with `saba certs dns`; saba retries with backoff, and immediately after `saba certs dns set`.")
+		case c.Status == "failed":
+			add("cert:"+c.Names[0], false, "Certificate could not be issued: "+c.Error,
+				"Point the domain's DNS (A/AAAA) at this server and keep ports 80 and 443 reachable; saba retries on the next HTTPS request.")
 		case c.Source != "custom":
 		case left <= 0:
 			add("cert:"+c.ID, false, "Custom certificate has expired and is no longer used",
