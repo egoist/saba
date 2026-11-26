@@ -119,6 +119,9 @@ func (e *Engine) waitHealthy(ctx context.Context, r *Run, a *store.AppRecord, de
 			r.logf("deploy", "%s produced no output.", out.rep.Container)
 		}
 		out.err.WithDetail("replica", out.rep.Index).WithDetail("version", dep.Version)
+		if out.rep.Addr != "" && spec.mode == "http" {
+			out.err.Hint = fmt.Sprintf("Node %s is in direct mode: the primary must be able to reach %s:%d over the private network (check firewalls). ", out.rep.Node, out.rep.Addr, out.rep.HostPort) + out.err.Hint
+		}
 		if spec.mode == "http" {
 			if img, ierr := e.RT.InspectImage(lctx, dep.Image); ierr == nil && len(img.ExposedPorts) > 0 && !containsInt(img.ExposedPorts, dep.Port) {
 				out.err.Hint = fmt.Sprintf("The image exposes port %d but the app is configured with port %d — try `port = %d`. ", img.ExposedPorts[0], dep.Port, img.ExposedPorts[0]) + out.err.Hint
@@ -200,7 +203,7 @@ func (e *Engine) probe(ctx context.Context, spec healthSpec, c *runtime.Containe
 		}
 		return true, ""
 	case "http":
-		url := fmt.Sprintf("http://127.0.0.1:%d%s", rep.HostPort, spec.path)
+		url := fmt.Sprintf("http://%s:%d%s", replicaHost(rep), rep.HostPort, spec.path)
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 		if err != nil {
 			return false, err.Error()

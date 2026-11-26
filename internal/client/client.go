@@ -619,3 +619,22 @@ func (c *Client) CertAdd(ctx context.Context, certPEM, keyPEM string) (*api.Cert
 func (c *Client) CertRemove(ctx context.Context, id string) error {
 	return c.json(ctx, "DELETE", "/v1/certs/"+url.PathEscape(id), nil, nil, nil)
 }
+
+func (c *Client) BackupStorage(ctx context.Context) (*api.S3Config, error) {
+	var out api.S3Config
+	return &out, c.json(ctx, "GET", "/v1/backup-storage", nil, nil, &out)
+}
+
+// SetBackupStorage verifies and saves the S3 destination for backups.
+func (c *Client) SetBackupStorage(ctx context.Context, cfg api.S3Config, createBucket bool) (*api.S3Config, error) {
+	body := struct {
+		api.S3Config
+		CreateBucket bool `json:"create_bucket"`
+	}{cfg, createBucket}
+	var out api.S3Config
+	return &out, c.json(ctx, "PUT", "/v1/backup-storage", nil, body, &out)
+}
+
+func (c *Client) RemoveBackupStorage(ctx context.Context) error {
+	return c.json(ctx, "DELETE", "/v1/backup-storage", nil, nil, nil)
+}

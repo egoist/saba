@@ -151,6 +151,13 @@ type BackupPolicy struct {
 type Backup struct {
 	ID  string `json:"id"`
 	App string `json:"app"`
+	// File is the backup's file name (<id>.<format>.gz).
+	File string `json:"file"`
+	// Location says where copies exist: "local", "s3" or "local+s3".
+	Location string `json:"location"`
+	// Warning is set when the backup exists but something went wrong, e.g.
+	// the upload to S3 failed.
+	Warning string `json:"warning,omitempty"`
 	// Kind is "manual" or "scheduled". Only scheduled backups are pruned.
 	Kind      string    `json:"kind"`
 	Engine    string    `json:"engine"`
@@ -190,7 +197,10 @@ type Source struct {
 
 type Replica struct {
 	// Node is the server the replica runs on; empty means the primary.
-	Node        string `json:"node,omitempty"`
+	Node string `json:"node,omitempty"`
+	// Addr is the address the replica is published on when the primary
+	// reaches it directly; empty means loopback (local, or an SSH tunnel).
+	Addr        string `json:"addr,omitempty"`
 	Index       int    `json:"index"`
 	Container   string `json:"container"`
 	ContainerID string `json:"container_id,omitempty"`
@@ -330,6 +340,24 @@ type ServerConfig struct {
 	// DNSHook is an executable that creates and removes DNS-01 challenge
 	// records, for other DNS hosts.
 	DNSHook string `json:"dns_hook,omitempty"`
+	// BackupS3 is the off-site destination database backups are mirrored to.
+	BackupS3 *S3Config `json:"backup_s3,omitempty"`
+}
+
+// S3Config addresses a bucket on S3-compatible object storage.
+type S3Config struct {
+	// Endpoint is the service URL; empty means AWS S3 in Region.
+	Endpoint string `json:"endpoint,omitempty"`
+	Region   string `json:"region,omitempty"`
+	Bucket   string `json:"bucket"`
+	// Prefix is prepended to every object key.
+	Prefix      string `json:"prefix,omitempty"`
+	AccessKeyID string `json:"access_key_id"`
+	// SecretAccessKey is write-only: it is never returned in full.
+	SecretAccessKey string `json:"secret_access_key,omitempty"`
+	// PathStyle selects https://endpoint/bucket/key addressing. Unset means
+	// automatic: virtual-hosted for AWS, path-style everywhere else.
+	PathStyle *bool `json:"path_style,omitempty"`
 }
 
 // Certificate is a stored (custom or DNS-issued) TLS certificate, or a
@@ -360,6 +388,10 @@ type Node struct {
 	// Address is the node's address on the network shared with the other
 	// nodes (optional); see ServerConfig.Address.
 	Address string `json:"address,omitempty"`
+	// Direct makes the primary send traffic for this node's replicas straight
+	// to Address instead of through the SSH tunnel. Faster, unencrypted: only
+	// for a private network between the servers.
+	Direct bool `json:"direct,omitempty"`
 	// HostKeys pins the node's SSH host keys (known_hosts key fields).
 	HostKeys  []string  `json:"host_keys,omitempty"`
 	CreatedAt time.Time `json:"created_at"`

@@ -5,6 +5,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/spf13/cobra"
 
@@ -21,9 +22,12 @@ func (c *CLI) dbBackupCmds() []*cobra.Command {
 stored on the server in /var/lib/saba/backups/<database>/.
 
 Scheduled backups are pruned to the newest --keep; manual ones are kept until
-you delete them. Backups live on the same server as the database, so copy them
-elsewhere for disaster recovery: "saba db backup create <db> -o <file>" from
-another machine does both in one step.`,
+you delete them.
+
+Configure S3-compatible storage once ("saba db backup s3 set") and every
+backup is also uploaded there. Listing, downloading and restoring then work
+from the bucket too, so the backups of a lost server are available on its
+replacement.`,
 		Example: `  saba db backup create main                    # dump now, keep it on the server
   saba db backup create main -o main.sql.gz     # ...and download it
   saba db backup schedule main @daily --keep 14 # automatic backups (UTC)
@@ -31,7 +35,8 @@ another machine does both in one step.`,
   saba db backup list main
   saba db backup download main latest
   saba db restore main --backup latest --yes
-  saba db restore main ./main.sql.gz --yes`,
+  saba db restore main ./main.sql.gz --yes
+  saba db backup s3 set --bucket my-backups --region eu-central-1`,
 	}
 
 	var out string
@@ -54,17 +59,24 @@ another machine does both in one step.`,
 					return err
 				}
 			}
-			return c.result(backupResult{Backup: b, File: file}, func() {
+			return c.result(backupResult{Backup: b, SavedTo: file}, func() {
 				// With `-o -` the dump itself is on stdout; keep messages off it.
 				ui := c.ui
 				if out == "-" {
 					ui = newUI(c.stderr, c.noColor)
 				}
-				ui.success("Backup %s of %s created (%s)", b.ID, ui.bold(args[0]), humanBytes(b.Size))
+				ui.success("Backup %s of %s created (%s, %s)", b.ID, ui.bold(args[0]), humanBytes(b.Size), b.Location)
+				if b.Warning != "" {
+					ui.printf("%s %s\n", ui.yellow("!"), b.Warning)
+				}
 				if file != "" && file != "-" {
 					ui.note("Saved to %s", file)
 				} else if file == "" {
-					ui.note("Stored on the server. Download it with `saba db backup download %s %s`.", args[0], b.ID)
+					where := "on the server"
+					if strings.Contains(b.Location, "s3") {
+						where = "on the server and in S3"
+					}
+					ui.note("Stored %s. Download it with `saba db backup download %s %s`.", where, args[0], b.ID)
 				}
 			})
 		},
@@ -92,9 +104,9 @@ another machine does both in one step.`,
 				}
 				rows := make([][]string, 0, len(backups))
 				for _, b := range backups {
-					rows = append(rows, []string{b.ID, b.Kind, humanBytes(b.Size), ago(b.CreatedAt)})
+					rows = append(rows, []string{b.ID, b.Kind, humanBytes(b.Size), b.Location, ago(b.CreatedAt)})
 				}
-				c.ui.table([]string{"ID", "KIND", "SIZE", "CREATED"}, rows)
+				c.ui.table([]string{"ID", "KIND", "SIZE", "LOCATION", "CREATED"}, rows)
 			})
 		},
 	}
@@ -191,7 +203,7 @@ argument, the current policy is shown. The database is not restarted.`,
 		},
 	}
 	schedule.Flags().IntVar(&keep, "keep", 0, "Number of scheduled backups to retain (default 7)")
-	backup.AddCommand(create, list, download, del, schedule)
+	backup.AddCommand(create, list, download, del, schedule, c.backupS3Cmd())
 
 	var (
 		fromBackup string
@@ -265,7 +277,8 @@ database is left unchanged. This command requires --yes.`,
 
 type backupResult struct {
 	*api.Backup
-	File string `json:"file,omitempty"`
+	// SavedTo is the local path the backup was downloaded to (with -o).
+	SavedTo string `json:"saved_to,omitempty"`
 }
 
 // downloadBackup writes a stored backup to dest: a file, a directory (the
@@ -310,4 +323,152 @@ func (c *CLI) downloadBackup(cmd *cobra.Command, cl *client.Client, name, id, de
 		return "", err
 	}
 	return final, nil
+}
+
+func (c *CLI) backupS3Cmd() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "s3",
+		Short: "Mirror backups to S3-compatible storage",
+		Long: `Send every database backup to a bucket as well: AWS S3, Cloudflare R2,
+Backblaze B2, MinIO, RustFS or anything else that speaks the S3 API.
+
+Once set:
+  - new backups (manual and scheduled) are uploaded right after they are made,
+    and existing ones are uploaded in the background
+  - "list", "download" and "restore" also see backups that exist only in the
+    bucket, so a replacement server can restore the old server's backups
+  - retention (--keep) and "delete" apply to the bucket too
+  - "saba doctor" reports failed uploads
+
+Objects are stored as <prefix>/<database>/<backup-id>.<format>.gz.`,
+		Example: `  # AWS: endpoint is derived from the region; keys come from the environment
+  AWS_ACCESS_KEY_ID=... AWS_SECRET_ACCESS_KEY=... saba db backup s3 set --bucket my-backups --region eu-central-1
+
+  # Cloudflare R2
+  saba db backup s3 set --bucket my-backups --endpoint https://<account>.r2.cloudflarestorage.com \
+      --region auto --access-key-id <id> --secret-access-key -      # secret read from stdin
+
+  saba db backup s3 show
+  saba db backup s3 remove`,
+		Args: maxArgs(0),
+		RunE: func(cmd *cobra.Command, args []string) error { return c.backupS3Show(cmd) },
+	}
+	show := &cobra.Command{
+		Use: "show", Short: "Show the configured bucket", Args: maxArgs(0),
+		RunE: func(cmd *cobra.Command, args []string) error { return c.backupS3Show(cmd) },
+	}
+
+	var (
+		cfg          api.S3Config
+		pathStyle    bool
+		createBucket bool
+	)
+	set := &cobra.Command{
+		Use:   "set --bucket <name>",
+		Short: "Set (and verify) the bucket backups are uploaded to",
+		Long: `Save the S3 destination. The server first proves the settings work by
+writing, reading, listing and deleting a small object; nothing is saved if
+that fails.
+
+The access key and secret default to AWS_ACCESS_KEY_ID and
+AWS_SECRET_ACCESS_KEY from this machine's environment. Pass "-" as the secret
+to read it from stdin.`,
+		Args: maxArgs(0),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if cfg.Bucket == "" {
+				return api.Errorf(api.CodeInvalid, "--bucket is required").
+					WithHint("Example: `saba db backup s3 set --bucket my-backups --region eu-central-1`.")
+			}
+			if cfg.AccessKeyID == "" {
+				cfg.AccessKeyID = os.Getenv("AWS_ACCESS_KEY_ID")
+			}
+			switch cfg.SecretAccessKey {
+			case "":
+				cfg.SecretAccessKey = os.Getenv("AWS_SECRET_ACCESS_KEY")
+			case "-":
+				b, err := io.ReadAll(io.LimitReader(os.Stdin, 64*1024))
+				if err != nil {
+					return err
+				}
+				cfg.SecretAccessKey = strings.TrimSpace(string(b))
+			}
+			if cmd.Flags().Changed("path-style") {
+				cfg.PathStyle = &pathStyle
+			}
+			cl, err := c.api()
+			if err != nil {
+				return err
+			}
+			saved, err := cl.SetBackupStorage(cmd.Context(), cfg, createBucket)
+			if err != nil {
+				return err
+			}
+			return c.result(saved, func() {
+				c.ui.success("Backups are mirrored to %s", c.ui.bold(s3URL(saved)))
+				c.ui.note("Verified: write, read, list and delete all work. Existing backups are being uploaded in the background.")
+			})
+		},
+	}
+	fl := set.Flags()
+	fl.StringVar(&cfg.Bucket, "bucket", "", "Bucket name")
+	fl.StringVar(&cfg.Endpoint, "endpoint", "", "Service URL (default: AWS S3 in --region)")
+	fl.StringVar(&cfg.Region, "region", "", "Region (default us-east-1; often \"auto\" for non-AWS services)")
+	fl.StringVar(&cfg.Prefix, "prefix", "", "Key prefix inside the bucket, e.g. saba/prod")
+	fl.StringVar(&cfg.AccessKeyID, "access-key-id", "", "Access key id (default: $AWS_ACCESS_KEY_ID)")
+	fl.StringVar(&cfg.SecretAccessKey, "secret-access-key", "", "Secret access key, or - to read it from stdin (default: $AWS_SECRET_ACCESS_KEY)")
+	fl.BoolVar(&pathStyle, "path-style", false, "Force path-style (true) or virtual-hosted (false) addressing; default: automatic")
+	fl.BoolVar(&createBucket, "create-bucket", false, "Create the bucket if it does not exist")
+
+	remove := &cobra.Command{
+		Use: "remove", Aliases: []string{"rm"}, Short: "Stop uploading backups (objects in the bucket are kept)", Args: maxArgs(0),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			cl, err := c.api()
+			if err != nil {
+				return err
+			}
+			if err := cl.RemoveBackupStorage(cmd.Context()); err != nil {
+				return err
+			}
+			return c.result(map[string]bool{"removed": true}, func() {
+				c.ui.success("Backups are no longer uploaded")
+				c.ui.note("Nothing was deleted from the bucket.")
+			})
+		},
+	}
+	cmd.AddCommand(show, set, remove)
+	return cmd
+}
+
+func s3URL(cfg *api.S3Config) string {
+	u := "s3://" + cfg.Bucket
+	if cfg.Prefix != "" {
+		u += "/" + strings.Trim(cfg.Prefix, "/")
+	}
+	if cfg.Endpoint != "" {
+		u += " (" + cfg.Endpoint + ")"
+	}
+	return u
+}
+
+func (c *CLI) backupS3Show(cmd *cobra.Command) error {
+	cl, err := c.api()
+	if err != nil {
+		return err
+	}
+	cfg, err := cl.BackupStorage(cmd.Context())
+	if err != nil {
+		return err
+	}
+	return c.result(cfg, func() {
+		if cfg.Bucket == "" {
+			c.ui.printf("Backups are stored on the server only. Mirror them to a bucket with `saba db backup s3 set --bucket <name>`.\n")
+			return
+		}
+		field := func(k, v string) { c.ui.printf("%s %s\n", c.ui.dim(pad(k, 12)), v) }
+		field("Bucket", cfg.Bucket)
+		field("Endpoint", orDash(cfg.Endpoint))
+		field("Region", orDash(cfg.Region))
+		field("Prefix", orDash(cfg.Prefix))
+		field("Access key", cfg.AccessKeyID)
+	})
 }

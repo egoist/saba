@@ -36,6 +36,10 @@ func (d *Daemon) routes() http.Handler {
 	h("GET /v1/stats", d.handleStats)
 	h("POST /v1/prune", d.handlePrune)
 
+	h("GET /v1/backup-storage", d.handleStorageGet)
+	h("PUT /v1/backup-storage", d.handleStorageSet)
+	h("DELETE /v1/backup-storage", d.handleStorageRemove)
+
 	h("GET /v1/certs", d.handleCerts)
 	h("POST /v1/certs", d.handleCertAdd)
 	h("DELETE /v1/certs/{id}", d.handleCertRemove)
@@ -523,7 +527,7 @@ func (d *Daemon) handlePrune(w http.ResponseWriter, r *http.Request) error {
 }
 
 func (d *Daemon) handleBackups(w http.ResponseWriter, r *http.Request) error {
-	backups, err := d.engine.Backups(r.PathValue("app"))
+	backups, err := d.engine.Backups(r.Context(), r.PathValue("app"))
 	if err != nil {
 		return err
 	}
@@ -544,7 +548,7 @@ func (d *Daemon) handleBackupCreate(w http.ResponseWriter, r *http.Request) erro
 }
 
 func (d *Daemon) handleBackupDownload(w http.ResponseWriter, r *http.Request) error {
-	f, b, err := d.engine.OpenBackup(r.PathValue("app"), r.PathValue("id"))
+	f, b, err := d.engine.OpenBackup(r.Context(), r.PathValue("app"), r.PathValue("id"))
 	if err != nil {
 		return err
 	}
@@ -552,13 +556,13 @@ func (d *Daemon) handleBackupDownload(w http.ResponseWriter, r *http.Request) er
 	w.Header().Set("Content-Type", "application/gzip")
 	w.Header().Set("Content-Length", strconv.FormatInt(b.Size, 10))
 	w.Header().Set("X-Saba-Backup-Id", b.ID)
-	w.Header().Set("X-Saba-Backup-File", filepath.Base(f.Name()))
+	w.Header().Set("X-Saba-Backup-File", b.File)
 	_, _ = io.Copy(w, f)
 	return nil
 }
 
 func (d *Daemon) handleBackupDelete(w http.ResponseWriter, r *http.Request) error {
-	if err := d.engine.DeleteBackup(r.PathValue("app"), r.PathValue("id")); err != nil {
+	if err := d.engine.DeleteBackup(r.Context(), r.PathValue("app"), r.PathValue("id")); err != nil {
 		return err
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"app": r.PathValue("app"), "deleted": r.PathValue("id")})

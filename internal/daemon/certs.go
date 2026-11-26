@@ -168,5 +168,12 @@ func redact(cfg api.ServerConfig) api.ServerConfig {
 		}
 		cfg.CloudflareAPIToken = "********" + tail
 	}
+	if cfg.BackupS3 != nil {
+		c := *cfg.BackupS3
+		if c.SecretAccessKey != "" {
+			c.SecretAccessKey = "********"
+		}
+		cfg.BackupS3 = &c
+	}
 	return cfg
 }

@@ -122,6 +122,8 @@ func Run(ctx context.Context, opts Options) error {
 		return err
 	}
 	d.engine.Nodes = d.cluster
+	remote := &remoteStore{}
+	d.engine.RemoteBackups = func() engine.RemoteStore { return remote.get(d.store.Snapshot().Server.BackupS3) }
 
 	acmeClient, err := acmeHTTPClient(opts.ACMECAFile)
 	if err != nil {
@@ -338,6 +340,14 @@ func (d *Daemon) cronLoop(ctx context.Context) {
 		}
 		tick := next.UTC()
 		go d.ensureCerts(ctx)
+		if tick.Minute() == 0 {
+			// Hourly: upload any backup that exists only on this server.
+			go func() {
+				if _, err := d.engine.SyncBackups(ctx); err != nil {
+					d.log.Warn("backup sync failed", "err", err)
+				}
+			}()
+		}
 		for _, name := range d.engine.DueBackups(tick) {
 			go d.runBackup(ctx, name)
 		}

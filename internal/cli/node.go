@@ -53,6 +53,7 @@ Good to know:
 	var (
 		address     string
 		noAuthorize bool
+		direct      bool
 	)
 	add := &cobra.Command{
 		Use:   "add <name> <user@host>",
@@ -66,8 +67,16 @@ Good to know:
 
 <user@host> must be reachable from the primary. If this machine cannot reach
 the node (e.g. it only has a private address), use --no-authorize and add the
-key printed by "saba node key" to the node's ~/.ssh/authorized_keys yourself.`,
-		Example: "  saba node add worker1 root@10.0.0.2\n  saba node add worker1 root@203.0.113.20 --address 10.0.0.2",
+key printed by "saba node key" to the node's ~/.ssh/authorized_keys yourself.
+
+Traffic to the node's replicas goes through the SSH connection by default:
+encrypted, and nothing to configure. When the servers share a private network,
+--direct --address <private-ip> makes the primary connect to replicas straight
+over that network instead, which is faster. Replica ports are then open on
+that address, unencrypted, so only use it on a network you trust. Run the
+command again to change a node's settings; apps pick them up on their next
+deploy or restart.`,
+		Example: "  saba node add worker1 root@203.0.113.20\n  saba node add worker1 root@10.0.0.2 --address 10.0.0.2 --direct",
 		Args:    exactArgs(2),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			name, target := args[0], args[1]
@@ -78,7 +87,7 @@ key printed by "saba node key" to the node's ~/.ssh/authorized_keys yourself.`,
 			if err != nil {
 				return err
 			}
-			node := api.Node{Name: name, SSH: target, Address: address}
+			node := api.Node{Name: name, SSH: target, Address: address, Direct: direct}
 			if !noAuthorize {
 				key, err := cl.NodeKey(cmd.Context())
 				if err != nil {
@@ -95,12 +104,17 @@ key printed by "saba node key" to the node's ~/.ssh/authorized_keys yourself.`,
 				return err
 			}
 			return c.result(added, func() {
-				c.ui.success("Node %s added (Docker %s)", c.ui.bold(name), added.Docker)
+				mode := "traffic goes through the SSH tunnel"
+				if added.Direct {
+					mode = "traffic goes directly to " + added.Address
+				}
+				c.ui.success("Node %s added (Docker %s, %s)", c.ui.bold(name), added.Docker, mode)
 				c.ui.note("Run replicas on it with `saba deploy -a <app> --node local --node %s --replicas 2`.", name)
 			})
 		},
 	}
 	add.Flags().StringVar(&address, "address", "", "The node's address on the network shared with the other servers (for cross-node access to published ports)")
+	add.Flags().BoolVar(&direct, "direct", false, "Send replica traffic straight to --address over a private network instead of through the SSH tunnel (faster, unencrypted)")
 	add.Flags().BoolVar(&noAuthorize, "no-authorize", false, "Do not log in to the node from this machine; the primary's key is already authorized there")
 
 	var yes bool
@@ -162,9 +176,16 @@ func (c *CLI) nodeList(cmd *cobra.Command) error {
 			} else {
 				status = c.ui.red(n.Status)
 			}
-			rows = append(rows, []string{n.Name, status, target, orDash(n.Address), orDash(n.Docker), strconv.Itoa(n.Replicas)})
+			traffic := "ssh tunnel"
+			switch {
+			case n.Name == api.LocalNode:
+				traffic = "-"
+			case n.Direct:
+				traffic = "direct"
+			}
+			rows = append(rows, []string{n.Name, status, target, orDash(n.Address), traffic, orDash(n.Docker), strconv.Itoa(n.Replicas)})
 		}
-		c.ui.table([]string{"NAME", "STATUS", "SSH", "ADDRESS", "DOCKER", "REPLICAS"}, rows)
+		c.ui.table([]string{"NAME", "STATUS", "SSH", "ADDRESS", "TRAFFIC", "DOCKER", "REPLICAS"}, rows)
 		for _, n := range nodes {
 			if n.Error != "" {
 				c.ui.printf("%s %s: %s\n", c.ui.red("!"), n.Name, n.Error)

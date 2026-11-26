@@ -8,11 +8,16 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
+	"fmt"
 	"io"
 	"math/big"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -37,10 +42,10 @@ func TestDatabaseBackupsThroughTheCLI(t *testing.T) {
 	code, out, _ = saba("db", "backup", "create", "main", "-o", dir, "--json")
 	b = backupResult{}
 	mustJSON(t, out, &b)
-	if code != 0 || filepath.Dir(b.File) != dir || !strings.HasSuffix(b.File, ".sql.gz") {
+	if code != 0 || filepath.Dir(b.SavedTo) != dir || !strings.HasSuffix(b.SavedTo, ".sql.gz") {
 		t.Fatalf("backup download: %d %s", code, out)
 	}
-	f, err := os.Open(b.File)
+	f, err := os.Open(b.SavedTo)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -71,7 +76,7 @@ func TestDatabaseBackupsThroughTheCLI(t *testing.T) {
 	if code, out, errOut = saba("db", "restore", "main", "--backup", "latest", "--yes", "--json"); code != 0 || !strings.Contains(out, list[0].ID) {
 		t.Fatalf("restore from a stored backup: %d %s %s", code, out, errOut)
 	}
-	if code, _, errOut = saba("db", "restore", "main", b.File, "--yes", "--json"); code != 0 {
+	if code, _, errOut = saba("db", "restore", "main", b.SavedTo, "--yes", "--json"); code != 0 {
 		t.Fatalf("restore from a file: %s", errOut)
 	}
 
@@ -184,5 +189,136 @@ func TestNodesCertsAndSecretsThroughTheCLI(t *testing.T) {
 	}
 	if code, _, _ = saba("server", "config", "set", "dns_hook", "relative/path", "--json"); code != api.ExitUsage {
 		t.Fatalf("a relative dns_hook must be rejected, exit %d", code)
+	}
+}
+
+// fakeS3 is a minimal in-memory S3 endpoint: enough of the API for saba's
+// backup mirroring, without signature checks.
+func fakeS3(t *testing.T) (endpoint string, objects func() []string) {
+	t.Helper()
+	var mu sync.Mutex
+	store := map[string][]byte{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
+		if !strings.HasPrefix(r.Header.Get("Authorization"), "AWS4-HMAC-SHA256 Credential=test-key/") {
+			http.Error(w, "<Error><Code>AccessDenied</Code><Message>bad credentials</Message></Error>", http.StatusForbidden)
+			return
+		}
+		key := strings.TrimPrefix(r.URL.Path, "/bucket/")
+		switch {
+		case r.URL.Path == "/bucket" && r.URL.Query().Get("list-type") == "2":
+			var b strings.Builder
+			b.WriteString("<ListBucketResult><IsTruncated>false</IsTruncated>")
+			for k, v := range store {
+				if strings.HasPrefix(k, r.URL.Query().Get("prefix")) {
+					fmt.Fprintf(&b, "<Contents><Key>%s</Key><Size>%d</Size><LastModified>2026-01-01T00:00:00Z</LastModified></Contents>", k, len(v))
+				}
+			}
+			b.WriteString("</ListBucketResult>")
+			io.WriteString(w, b.String())
+		case r.Method == http.MethodPut:
+			store[key], _ = io.ReadAll(r.Body)
+		case r.Method == http.MethodGet:
+			v, ok := store[key]
+			if !ok {
+				http.Error(w, "<Error><Code>NoSuchKey</Code></Error>", http.StatusNotFound)
+				return
+			}
+			w.Write(v)
+		case r.Method == http.MethodDelete:
+			delete(store, key)
+			w.WriteHeader(http.StatusNoContent)
+		}
+	}))
+	t.Cleanup(srv.Close)
+	return srv.URL, func() []string {
+		mu.Lock()
+		defer mu.Unlock()
+		var keys []string
+		for k := range store {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		return keys
+	}
+}
+
+func TestBackupsToS3ThroughTheCLI(t *testing.T) {
+	startDaemon(t)
+	endpoint, objects := fakeS3(t)
+	saba("db", "create", "main", "--engine", "postgres", "--json")
+
+	if code, out, _ := saba("db", "backup", "s3", "show", "--json"); code != 0 || !strings.Contains(out, `"bucket": ""`) {
+		t.Fatalf("show before configuring: %d %s", code, out)
+	}
+	// Settings that do not work are rejected and not saved.
+	code, _, errOut := saba("db", "backup", "s3", "set", "--bucket", "bucket", "--endpoint", endpoint, "--access-key-id", "wrong", "--secret-access-key", "x", "--json")
+	if code != api.ExitUsage || !strings.Contains(errOut, "AccessDenied") {
+		t.Fatalf("bad credentials: %d %s", code, errOut)
+	}
+	if code, _, _ = saba("db", "backup", "s3", "set", "--endpoint", endpoint, "--json"); code != api.ExitUsage {
+		t.Fatalf("a bucket is required, exit %d", code)
+	}
+
+	// Credentials default to the AWS environment variables.
+	const secret = "s3-secret-value-123456"
+	t.Setenv("AWS_ACCESS_KEY_ID", "test-key")
+	t.Setenv("AWS_SECRET_ACCESS_KEY", secret)
+	code, out, errOut := saba("db", "backup", "s3", "set", "--bucket", "bucket", "--endpoint", endpoint, "--prefix", "prod/", "--json")
+	if code != 0 || strings.Contains(out, secret) || !strings.Contains(out, `"access_key_id": "test-key"`) {
+		t.Fatalf("s3 set: %d %s %s", code, out, errOut)
+	}
+	if got := objects(); len(got) != 0 {
+		t.Fatalf("the access check left objects behind: %v", got)
+	}
+
+	code, out, _ = saba("db", "backup", "create", "main", "--json")
+	var b backupResult
+	mustJSON(t, out, &b)
+	if code != 0 || b.Location != "local+s3" || b.Warning != "" {
+		t.Fatalf("backup with S3 configured: %s", out)
+	}
+	if got := objects(); len(got) != 1 || got[0] != "prod/main/"+b.Backup.File {
+		t.Fatalf("objects in the bucket: %v", got)
+	}
+	// Changing a setting does not require the secret again.
+	t.Setenv("AWS_SECRET_ACCESS_KEY", "")
+	if code, _, errOut = saba("db", "backup", "s3", "set", "--bucket", "bucket", "--endpoint", endpoint, "--prefix", "prod", "--region", "auto", "--json"); code != 0 {
+		t.Fatalf("updating without the secret: %s", errOut)
+	}
+	for _, args := range [][]string{{"db", "backup", "s3", "show", "--json"}, {"db", "backup", "s3", "show"}, {"server", "info", "--json"}, {"doctor", "--json"}} {
+		if _, out, errOut = saba(args...); strings.Contains(out+errOut, secret) {
+			t.Fatalf("%v leaks the S3 secret", args)
+		}
+	}
+	if _, out, _ = saba("doctor", "--json"); !strings.Contains(out, "s3://bucket/prod") {
+		t.Fatalf("doctor should report the mirror: %s", out)
+	}
+
+	// Deleting a backup removes it from the bucket as well.
+	if code, _, errOut = saba("db", "backup", "delete", "main", b.ID, "--yes", "--json"); code != 0 || len(objects()) != 0 {
+		t.Fatalf("delete: %s, bucket %v", errOut, objects())
+	}
+	if code, _, _ = saba("db", "backup", "s3", "remove", "--json"); code != 0 {
+		t.Fatal("s3 remove failed")
+	}
+	_, out, _ = saba("db", "backup", "create", "main", "--json")
+	if !strings.Contains(out, `"location": "local"`) {
+		t.Fatalf("after removing S3 backups should be local: %s", out)
+	}
+}
+
+func TestDirectNodeValidation(t *testing.T) {
+	startDaemon(t)
+	for name, args := range map[string][]string{
+		"no address":     {"node", "add", "w1", "root@198.51.100.7", "--direct", "--no-authorize"},
+		"public address": {"node", "add", "w1", "root@198.51.100.7", "--direct", "--address", "198.51.100.7", "--no-authorize"},
+		"not an address": {"node", "add", "w1", "root@198.51.100.7", "--direct", "--address", "node.internal", "--no-authorize"},
+	} {
+		code, _, errOut := saba(append(args, "--json")...)
+		if code != api.ExitUsage || errorCode(t, errOut) != api.CodeInvalid {
+			t.Errorf("%s: exit %d %s", name, code, errOut)
+		}
 	}
 }

@@ -58,6 +58,15 @@ func (d *Daemon) handleDoctor(w http.ResponseWriter, r *http.Request) error {
 		}
 	}
 
+	if s3cfg := st.Server.BackupS3; s3cfg != nil {
+		if msg := d.engine.RemoteBackupError(); msg != "" {
+			add("backup-storage", false, "The last S3 operation failed: "+msg,
+				"Backups made since are stored on this server only. Check the settings with `saba db backup s3 show`; setting them again uploads what is missing.")
+		} else {
+			add("backup-storage", true, "Backups are mirrored to s3://"+s3cfg.Bucket+"/"+s3cfg.Prefix, "")
+		}
+	}
+
 	status := d.cluster.Status()
 	for _, name := range sortedKeys(st.Nodes) {
 		if ns := status[name]; ns.Up {

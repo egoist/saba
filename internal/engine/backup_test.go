@@ -4,10 +4,13 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
+	"errors"
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -47,7 +50,7 @@ func TestBackupAndRestore(t *testing.T) {
 	if b.Kind != "manual" || b.Engine != "postgres" || b.Size == 0 || time.Since(b.CreatedAt) > time.Minute {
 		t.Fatalf("backup metadata: %+v", b)
 	}
-	f, _, err := h.engine.OpenBackup("main", "latest")
+	f, _, err := h.engine.OpenBackup(ctx, "main", "latest")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -95,10 +98,10 @@ func TestBackupAndRestore(t *testing.T) {
 	if len(entries) != 1 || strings.Contains(entries[0].Name(), "partial") {
 		t.Fatalf("backup directory: %v", entries)
 	}
-	if err := h.engine.DeleteBackup("main", b.ID); err != nil {
+	if err := h.engine.DeleteBackup(ctx, "main", b.ID); err != nil {
 		t.Fatal(err)
 	}
-	if list, _ := h.engine.Backups("main"); len(list) != 0 {
+	if list, _ := h.engine.Backups(ctx, "main"); len(list) != 0 {
 		t.Fatalf("backup not deleted: %v", list)
 	}
 }
@@ -173,7 +176,7 @@ func TestBackupScheduleAndRetention(t *testing.T) {
 		}
 		ids = append(ids, b.ID)
 	}
-	list, _ := h.engine.Backups("main")
+	list, _ := h.engine.Backups(ctx, "main")
 	var kept []string
 	manual := 0
 	for _, b := range list {
@@ -214,5 +217,172 @@ func TestBackupScheduleAndRetention(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(h.engine.DataDir, "backups", "other")); !os.IsNotExist(err) {
 		t.Fatal("destroy --volumes must delete backups")
+	}
+}
+
+// memStore is an in-memory RemoteStore.
+type memStore struct {
+	mu      sync.Mutex
+	objects map[string][]byte
+	down    bool
+}
+
+var errStoreDown = errors.New("connection refused")
+
+func (m *memStore) Put(_ context.Context, key string, f *os.File, size int64) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.down {
+		return errStoreDown
+	}
+	b, err := io.ReadAll(io.NewSectionReader(f, 0, size))
+	m.objects[key] = b
+	return err
+}
+
+func (m *memStore) Get(_ context.Context, key string) (io.ReadCloser, int64, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	b, ok := m.objects[key]
+	if m.down || !ok {
+		return nil, 0, errStoreDown
+	}
+	return io.NopCloser(bytes.NewReader(b)), int64(len(b)), nil
+}
+
+func (m *memStore) Delete(_ context.Context, key string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.down {
+		return errStoreDown
+	}
+	delete(m.objects, key)
+	return nil
+}
+
+func (m *memStore) List(_ context.Context, prefix string) ([]RemoteObject, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.down {
+		return nil, errStoreDown
+	}
+	var out []RemoteObject
+	for k, v := range m.objects {
+		if strings.HasPrefix(k, prefix) {
+			out = append(out, RemoteObject{Key: k, Size: int64(len(v))})
+		}
+	}
+	return out, nil
+}
+
+func (m *memStore) keys() []string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var out []string
+	for k := range m.objects {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
+}
+
+func TestBackupsAreMirroredToRemoteStorage(t *testing.T) {
+	h := newHarness(t)
+	ctx := context.Background()
+	container := newDatabase(t, h, "main", "postgres")
+	h.rt.SetData(container, "before storage")
+
+	// A backup made before storage is configured is local only...
+	early, err := h.engine.Backup(ctx, "main", "manual")
+	if err != nil || early.Location != "local" {
+		t.Fatalf("early backup: %+v %v", early, err)
+	}
+	remote := &memStore{objects: map[string][]byte{}}
+	h.engine.RemoteBackups = func() RemoteStore { return remote }
+	// ...until a sync uploads it.
+	if n, err := h.engine.SyncBackups(ctx); err != nil || n != 1 {
+		t.Fatalf("sync uploaded %d: %v", n, err)
+	}
+
+	h.rt.SetData(container, "precious data")
+	b, err := h.engine.Backup(ctx, "main", "manual")
+	if err != nil || b.Location != "local+s3" || b.Warning != "" {
+		t.Fatalf("mirrored backup: %+v %v", b, err)
+	}
+	if keys := remote.keys(); len(keys) != 2 || keys[1] != "main/"+b.File {
+		t.Fatalf("objects in the bucket: %v", keys)
+	}
+
+	// Disaster: this server's copies are gone. The bucket's are listed and restorable.
+	if err := os.RemoveAll(h.engine.backupDir("main")); err != nil {
+		t.Fatal(err)
+	}
+	h.rt.SetData(container, "")
+	list, _ := h.engine.Backups(ctx, "main")
+	if len(list) != 2 || list[0].ID != b.ID || list[0].Location != "s3" || list[0].Size == 0 {
+		t.Fatalf("listing from the bucket: %+v", list)
+	}
+	if _, err := h.engine.RestoreBackup(ctx, "main", "latest"); err != nil {
+		t.Fatal(err)
+	}
+	if got := h.rt.Data(container); got != "precious data" {
+		t.Fatalf("restored from the bucket: %q", got)
+	}
+
+	// An outage: the backup still succeeds locally, with a warning, and the
+	// failure is visible to `saba doctor`.
+	remote.down = true
+	local, err := h.engine.Backup(ctx, "main", "manual")
+	if err != nil || local.Location != "local" || !strings.Contains(local.Warning, "upload to S3 failed") {
+		t.Fatalf("backup during an outage: %+v %v", local, err)
+	}
+	if h.engine.RemoteBackupError() == "" {
+		t.Fatal("the failed upload was not recorded")
+	}
+	remote.down = false
+	if n, err := h.engine.SyncBackups(ctx); err != nil || n != 1 || h.engine.RemoteBackupError() != "" {
+		t.Fatalf("sync after the outage uploaded %d: %v (%q)", n, err, h.engine.RemoteBackupError())
+	}
+
+	// Retention and deletion apply to the bucket as well.
+	if _, err := h.engine.SetBackupPolicy("main", api.BackupPolicy{Schedule: "@daily", Keep: 1}); err != nil {
+		t.Fatal(err)
+	}
+	var newest string
+	for i := 0; i < 3; i++ {
+		s, err := h.engine.Backup(ctx, "main", "scheduled")
+		if err != nil {
+			t.Fatal(err)
+		}
+		newest = s.File
+	}
+	scheduled := 0
+	for _, k := range remote.keys() {
+		if strings.Contains(k, "-scheduled") {
+			scheduled++
+			if k != "main/"+newest {
+				t.Fatalf("pruning kept the wrong scheduled backup in the bucket: %s", k)
+			}
+		}
+	}
+	if scheduled != 1 || len(remote.keys()) != 4 {
+		t.Fatalf("after pruning the bucket holds %v", remote.keys())
+	}
+	if err := h.engine.DeleteBackup(ctx, "main", b.ID); err != nil {
+		t.Fatal(err)
+	}
+	for _, k := range remote.keys() {
+		if strings.Contains(k, b.ID) {
+			t.Fatalf("deleted backup is still in the bucket: %s", k)
+		}
+	}
+
+	// Destroying a database, even with its data, never touches the bucket.
+	before := len(remote.keys())
+	if _, err := h.engine.Destroy(ctx, "main", true); err != nil {
+		t.Fatal(err)
+	}
+	if len(remote.keys()) != before {
+		t.Fatal("destroy removed off-site backups")
 	}
 }

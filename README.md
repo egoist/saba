@@ -52,7 +52,7 @@ $ cd my-app && saba deploy
 | Config | Declarative `saba.toml`, or flags that the server remembers |
 | Secrets | `saba env set`, with `${{db.URL}}`-style references between apps |
 | Databases | Postgres, MySQL, MariaDB, Redis, MongoDB with volumes and generated credentials |
-| Backups | On-demand and scheduled database backups with retention, download and restore |
+| Backups | On-demand and scheduled database backups with retention, mirrored to S3-compatible storage; restore from the server or the bucket |
 | Cron | Scheduled commands in the app's image |
 | Operations | Logs, exec, one-off runs, stats, `saba doctor` diagnostics |
 | Upgrades | The daemon restarts without refusing or dropping requests (systemd socket activation) |
@@ -118,6 +118,7 @@ saba logs -f                      # tail logs
 saba env set STRIPE_KEY=sk_...    # set a secret and roll it out
 saba db create main --engine postgres && saba db link main -a api
 saba db backup schedule main @daily   # automatic backups, newest 7 kept
+saba db backup s3 set --bucket my-backups --region eu-central-1   # ...and off-site copies
 saba scale 3
 saba rollback                     # something went wrong
 saba doctor                       # why is something wrong
@@ -142,10 +143,43 @@ SSH connection, so traffic between servers is encrypted and needs no private net
 deploys, rollbacks, logs, exec and stats work the same across servers. If a node goes down, its
 replicas drop out of rotation and come back on their own when it returns.
 
+When the servers share a private network (a VPC, WireGuard, Tailscale), skip the tunnel for
+request traffic and let the primary connect to replicas straight over that network:
+
+```sh
+saba node add worker1 root@10.0.0.2 --address 10.0.0.2 --direct
+```
+
+That is faster, and unencrypted: replica ports are open on the node's private address, so it is
+only accepted for private addresses. Docker is still driven over SSH either way.
+
 Two things stay per-server: volumes (apps with volumes and databases run on one node), and
 container names — `http://api:8080` resolves between containers on the same server. An app that
 publishes a port (`publish = ["10.0.0.1:5432:5432"]`) is also reachable by name from other
 nodes, at its server's address (`saba node add --address`, `saba server config set address`).
+
+## Database backups
+
+```sh
+saba db backup schedule main @daily --keep 14     # automatic, newest 14 kept
+saba db backup create main                        # one right now
+saba db restore main --backup latest --yes
+```
+
+Backups are compressed dumps kept on the server. Point saba at any S3-compatible bucket (AWS
+S3, Cloudflare R2, Backblaze B2, MinIO, RustFS, ...) and every backup is uploaded as well:
+
+```sh
+saba db backup s3 set --bucket my-backups --region eu-central-1      # keys from AWS_* env vars
+saba db backup s3 set --bucket my-backups --endpoint https://<account>.r2.cloudflarestorage.com \
+    --region auto --access-key-id <id> --secret-access-key -         # secret from stdin
+```
+
+The settings are verified before they are saved. From then on listing, downloading and
+restoring also work from the bucket, so after losing a server you set up a new one, configure
+the same bucket, create the database and `saba db restore <db> --backup latest --yes`.
+Retention and deletes apply to the bucket too; failed uploads are reported by `saba doctor`
+and retried.
 
 ## Certificates
 
@@ -237,12 +271,9 @@ saba is new. Known limitations:
 
 - The primary is a single point of failure: it terminates all traffic and holds the state.
   Worker nodes add capacity, not redundancy for the primary itself.
-- Traffic to replicas on other servers goes through an SSH tunnel. That keeps setup trivial and
-  encrypted, at some cost in throughput compared to a private network link.
 - Volumes are per-server and containers find each other by name only on the same server (see
   "Scaling across servers").
-- Database backups are stored on the server that runs saba. Copy them elsewhere for disaster
-  recovery (`saba db backup create <db> -o <file>` from another machine). Redis is not
-  supported by the backup commands.
+- Backups cover Postgres, MySQL, MariaDB and MongoDB; Redis is not supported by the backup
+  commands. Volumes of regular apps are not backed up.
 - Anyone who can SSH in as root or as a member of the `docker` group can control saba. There
   are no per-user permissions; access control is SSH.

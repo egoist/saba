@@ -89,6 +89,8 @@ saba db create <name> --engine postgres|mysql|mariadb|redis|mongo [--version V]
 saba db list | url <name> | link <name> -a <app> [--as VAR]
 saba db backup create <db> [-o file|dir|-] | list <db> | download <db> [id|latest] [-o ...]
 saba db backup delete <db> <id> --yes | schedule <db> [<cron>|off] [--keep N]
+saba db backup s3 [show] | set --bucket B [--endpoint URL] [--region R] [--prefix P]
+     [--access-key-id K] [--secret-access-key S|-] [--create-bucket] | remove
 saba db restore <db> (--backup <id>|latest | <file|->) --yes
 saba destroy <app> --yes [--volumes]
 
@@ -98,7 +100,8 @@ saba server setup <user@host> [--name N] [--email E] [--base-domain D] [--instal
                               server (same version as this CLI by default). Re-run to upgrade.
 saba server info | config | config set <key> <value|-> | prune
      keys: base_domain acme_email keep_versions address cloudflare_api_token dns_hook
-saba node [list] | add <name> <user@host> [--address IP] [--no-authorize] | remove <name> --yes | key
+saba node [list] | add <name> <user@host> [--address IP] [--direct] [--no-authorize]
+saba node remove <name> --yes | key
 saba certs [list] | add --cert <chain.pem> --key <key.pem> | remove <id> --yes
 saba mcp                      MCP server on stdio (same tools as this CLI)
 saba guide                    This document
@@ -199,7 +202,17 @@ saba db restore main --backup latest --yes      # or a local file, plain or .gz;
 
 Scheduled backups are pruned to the newest `--keep` (default 7); manual ones are never pruned.
 A Postgres restore is a single transaction: if it fails nothing changes. `saba destroy <db>
---volumes` also deletes its backups; without `--volumes` they are kept.
+--volumes` also deletes its backups on the server; without `--volumes` they are kept.
+
+Off-site copies: `saba db backup s3 set --bucket <b> ...` mirrors every backup to
+S3-compatible storage (keys default to `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY` of the CLI's
+environment; `--secret-access-key -` reads stdin). The settings are checked (write, read, list,
+delete) before being saved. Afterwards each backup's `location` is `local`, `s3` or
+`local+s3`; list, download, restore and delete work for all of them, retention applies to the
+bucket, and `destroy` never deletes from the bucket. If an upload fails the backup is still
+created (`warning` in the result, a failing `backup-storage` check in `saba doctor`) and is
+uploaded later automatically. Disaster recovery on a new server: configure the same bucket,
+`saba db create <same-name>`, then `saba db restore <name> --backup latest --yes`.
 
 ## Multiple servers
 
@@ -212,6 +225,10 @@ primary can reach the node, authorize the key from `saba node key` by hand and p
 - `nodes = ["local", "w1"]` (or `--node`, repeatable) spreads replicas round-robin; `["*"]`
   uses every server. Containers report their node in `saba status` and get `SABA_NODE`.
 - Images are built on the primary and sent to nodes automatically.
+- Traffic to a node's replicas goes through the SSH connection (encrypted, zero setup). On a
+  private network, `saba node add <name> <user@host> --address <private-ip> --direct` makes the
+  primary connect to replicas directly instead: faster, unencrypted, private addresses only.
+  Re-run `node add` to change a node; apps pick the change up on their next deploy or restart.
 - An unreachable node shows as `unreachable` in `saba node list` and `saba doctor`; its replicas
   leave the rotation and the app shows `degraded`. saba reconnects by itself.
 - Apps with `volumes` and databases must use exactly one node.
@@ -267,8 +284,9 @@ DeployResult { app, deployed, saved, dry_run, deployment, urls[], plan[] }     #
                                                          # scale, rollback, env set, domains add
 exec/run     { exit_code, stdout, stderr }
 doctor       { ok, checks[{name, ok, message, hint}] }
-Node         { name, ssh, address, status: connected|unreachable, error, docker_version, replicas }
-Backup       { id, app, kind: manual|scheduled, engine, size, created_at }
+Node         { name, ssh, address, direct, status: connected|unreachable, error, docker_version, replicas }
+Backup       { id, app, file, kind: manual|scheduled, engine, size, created_at,
+               location: local|s3|local+s3, warning }      # `backup create -o` adds saved_to
 Certificate  { id, names[], source: custom|dns, issuer, not_after, status: active|expired|pending|failed|skipped, error }
 Event        { type: "phase"|"log"|"result"|"error", time, phase, stream, message, result, error }
 ```

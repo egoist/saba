@@ -176,7 +176,7 @@ func (f *Fake) HasImage(ref string) bool {
 func hostAddr(ports []string) string {
 	for _, p := range ports {
 		parts := strings.Split(p, ":")
-		if len(parts) == 3 && parts[0] == "127.0.0.1" {
+		if len(parts) == 3 && strings.HasPrefix(parts[0], "127.") {
 			return parts[0] + ":" + parts[1]
 		}
 	}

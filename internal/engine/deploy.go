@@ -1012,7 +1012,7 @@ func (e *Engine) startReplicas(ctx context.Context, r *Run, a *store.AppRecord, 
 		defer cancel()
 		for _, rep := range replicas {
 			_ = e.rt(rep.Node).Remove(cctx, rep.Container)
-			if !isLocal(rep.Node) && rep.HostPort > 0 {
+			if tunneled(rep) {
 				e.Nodes.Unforward(cctx, rep.Node, rep.HostPort)
 			}
 		}
@@ -1026,6 +1026,12 @@ func (e *Engine) startReplicas(ctx context.Context, r *Run, a *store.AppRecord, 
 		}
 		rt := e.rt(node)
 		_ = rt.Remove(ctx, rep.Container) // leftover from a crashed attempt
+		// Where the replica's port is published: loopback (reached locally or
+		// through the SSH tunnel), or the node's private address in direct mode.
+		bind := "127.0.0.1"
+		if nd := st.Nodes[node]; !isLocal(node) && nd != nil && nd.Direct && nd.Address != "" {
+			bind, rep.Addr = nd.Address, nd.Address
+		}
 
 		var id string
 		// A port that is free on the primary may be taken on a remote node;
@@ -1048,8 +1054,10 @@ func (e *Engine) startReplicas(ctx context.Context, r *Run, a *store.AppRecord, 
 					return fail(perr)
 				}
 				rep.HostPort = hp
-				opts.Labels[LabelPort] = strconv.Itoa(hp)
-				opts.Ports = append(opts.Ports, fmt.Sprintf("127.0.0.1:%d:%d", hp, dep.Port))
+				if rep.Addr == "" {
+					opts.Labels[LabelPort] = strconv.Itoa(hp) // names the tunnel to close later
+				}
+				opts.Ports = append(opts.Ports, fmt.Sprintf("%s:%d:%d", bind, hp, dep.Port))
 			}
 			opts.Ports = append(opts.Ports, cfg.Publish...)
 			id, err = rt.Run(ctx, opts)
@@ -1075,7 +1083,7 @@ func (e *Engine) startReplicas(ctx context.Context, r *Run, a *store.AppRecord, 
 		}
 		rep.ContainerID = id
 		replicas = append(replicas, rep)
-		if !isLocal(node) && rep.HostPort > 0 {
+		if tunneled(rep) {
 			if err := e.Nodes.Forward(ctx, node, rep.HostPort); err != nil {
 				return fail(api.Errorf(api.CodeRuntime, "cannot open a tunnel to node %q: %v", node, err).
 					WithHint("Check the node with `saba node list`."))

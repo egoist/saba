@@ -63,12 +63,18 @@ type Engine struct {
 	TLS       bool
 	URLSuffix string
 
-	backupLocks map[string]*sync.Mutex // one backup or restore per database at a time
-	wg          sync.WaitGroup         // in-flight deployments, including their cleanup
-	mu          sync.Mutex
-	busy        map[string]*Run
-	logs        map[string]*EventLog
-	portCursor  int
+	// RemoteBackups returns the off-site store backups are mirrored to, or
+	// nil when none is configured.
+	RemoteBackups func() RemoteStore
+	remoteErr     string
+	needSync      bool                   // an upload failed; local-only backups await a catch-up
+	lastBackup    map[string]time.Time   // newest backup id handed out per database
+	backupLocks   map[string]*sync.Mutex // one backup or restore per database at a time
+	wg            sync.WaitGroup         // in-flight deployments, including their cleanup
+	mu            sync.Mutex
+	busy          map[string]*Run
+	logs          map[string]*EventLog
+	portCursor    int
 }
 
 func New(st *store.Store, rt runtime.Runtime, px *proxy.Proxy, dataDir string, log *slog.Logger) *Engine {
@@ -308,7 +314,7 @@ func addrs(replicas []api.Replica) []string {
 	var out []string
 	for _, r := range replicas {
 		if r.HostPort > 0 {
-			out = append(out, "127.0.0.1:"+strconv.Itoa(r.HostPort))
+			out = append(out, replicaHost(r)+":"+strconv.Itoa(r.HostPort))
 		}
 	}
 	return out
@@ -365,3 +371,14 @@ func labels(app string, version, replica int, role string) map[string]string {
 func bg(parent context.Context, d time.Duration) (context.Context, context.CancelFunc) {
 	return context.WithTimeout(context.WithoutCancel(parent), d)
 }
+
+// replicaHost is the address the primary uses to reach a replica.
+func replicaHost(r api.Replica) string {
+	if r.Addr != "" {
+		return r.Addr
+	}
+	return "127.0.0.1"
+}
+
+// tunneled reports whether a replica is reached through an SSH port forward.
+func tunneled(r api.Replica) bool { return !isLocal(r.Node) && r.Addr == "" && r.HostPort > 0 }

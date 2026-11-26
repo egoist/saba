@@ -672,7 +672,7 @@ func (e *Engine) Reconcile(ctx context.Context) {
 		for _, a := range st.Apps {
 			if cur := a.Current(); cur != nil {
 				for _, r := range cur.Replicas {
-					if !isLocal(r.Node) && r.HostPort > 0 {
+					if tunneled(r) {
 						if err := e.Nodes.Forward(ctx, r.Node, r.HostPort); err != nil {
 							e.Log.Warn("cannot restore tunnel", "node", r.Node, "port", r.HostPort, "err", err)
 						}

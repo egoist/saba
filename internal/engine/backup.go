@@ -113,9 +113,20 @@ func (e *Engine) Backup(ctx context.Context, name, kind string) (*api.Backup, er
 	// IDs are UTC timestamps, so they sort chronologically. A new backup is
 	// always newer than every existing one, even within the same second.
 	at := time.Now().UTC().Truncate(time.Second)
-	if existing, _ := e.Backups(name); len(existing) > 0 && !existing[0].CreatedAt.Before(at) {
+	if existing, _ := e.Backups(ctx, name); len(existing) > 0 && !existing[0].CreatedAt.Before(at) {
 		at = existing[0].CreatedAt.Add(time.Second)
 	}
+	// The listing can miss remote backups while the storage is unreachable;
+	// the last id handed out by this process is a second guard.
+	e.mu.Lock()
+	if e.lastBackup == nil {
+		e.lastBackup = map[string]time.Time{}
+	}
+	if last := e.lastBackup[name]; !last.Before(at) {
+		at = last.Add(time.Second)
+	}
+	e.lastBackup[name] = at
+	e.mu.Unlock()
 	id := at.Format("20060102T150405Z") + "-" + kind
 	final := filepath.Join(dir, id+"."+spec.ext+".gz")
 	// Written under a temporary name so a failed dump never looks like a backup.
@@ -154,25 +165,130 @@ func (e *Engine) Backup(ctx context.Context, name, kind string) (*api.Backup, er
 		os.Remove(tmp)
 		return nil, err
 	}
+	b, err := e.backup(ctx, name, id)
+	if err != nil {
+		return nil, err
+	}
+	e.Log.Info("backup created", "app", name, "id", id, "bytes", b.Size)
+	if remote := e.remote(); remote != nil {
+		uploadErr := e.upload(ctx, remote, name, b.File)
+		if uploadErr != nil {
+			// The backup itself succeeded; say clearly that it is local only.
+			b.Warning = "stored locally, but the upload to S3 failed: " + uploadErr.Error()
+			e.Log.Error("backup upload failed", "app", name, "id", id, "err", uploadErr)
+		} else {
+			b.Location = "local+s3"
+		}
+		e.noteRemote(uploadErr)
+		// Once uploads work again, catch up on what an outage left behind.
+		e.mu.Lock()
+		catchUp := uploadErr == nil && e.needSync
+		e.needSync = uploadErr != nil || (e.needSync && !catchUp)
+		e.mu.Unlock()
+		if catchUp {
+			go func() {
+				sctx, cancel := bg(ctx, time.Hour)
+				defer cancel()
+				if _, err := e.SyncBackups(sctx); err != nil {
+					e.mu.Lock()
+					e.needSync = true
+					e.mu.Unlock()
+				}
+			}()
+		}
+	}
 	if kind == "scheduled" {
 		keep := defaultBackupKeep
 		if p := a.Database.Backup; p != nil && p.Keep > 0 {
 			keep = p.Keep
 		}
-		e.pruneBackups(name, keep)
+		e.pruneBackups(ctx, name, keep)
 	}
-	b, err := e.backup(name, id)
-	if err != nil {
-		return nil, err
-	}
-	e.Log.Info("backup created", "app", name, "id", id, "bytes", b.Size)
 	return b, nil
 }
 
-// pruneBackups removes the oldest scheduled backups beyond keep. Manual
-// backups are never removed automatically.
-func (e *Engine) pruneBackups(name string, keep int) {
-	all, err := e.Backups(name)
+// RemoteStore is off-site storage that backups are mirrored to.
+type RemoteStore interface {
+	Put(ctx context.Context, key string, f *os.File, size int64) error
+	Get(ctx context.Context, key string) (io.ReadCloser, int64, error)
+	Delete(ctx context.Context, key string) error
+	List(ctx context.Context, prefix string) ([]RemoteObject, error)
+}
+
+type RemoteObject struct {
+	Key  string
+	Size int64
+}
+
+func (e *Engine) remote() RemoteStore {
+	if e.RemoteBackups == nil {
+		return nil
+	}
+	return e.RemoteBackups()
+}
+
+// noteRemote remembers the outcome of the last remote operation for `saba doctor`.
+func (e *Engine) noteRemote(err error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.remoteErr = ""
+	if err != nil {
+		e.remoteErr = err.Error()
+	}
+}
+
+// RemoteBackupError returns the error of the last remote backup operation, if it failed.
+func (e *Engine) RemoteBackupError() string {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.remoteErr
+}
+
+func (e *Engine) upload(ctx context.Context, remote RemoteStore, name, file string) error {
+	f, err := os.Open(filepath.Join(e.backupDir(name), file))
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	info, err := f.Stat()
+	if err != nil {
+		return err
+	}
+	return remote.Put(ctx, name+"/"+file, f, info.Size())
+}
+
+// SyncBackups uploads backups that exist only locally, e.g. the ones made
+// before remote storage was configured. It returns how many were uploaded.
+func (e *Engine) SyncBackups(ctx context.Context) (int, error) {
+	remote := e.remote()
+	if remote == nil {
+		return 0, nil
+	}
+	n := 0
+	for _, name := range e.Store.Snapshot().AppNames() {
+		list, err := e.Backups(ctx, name)
+		if err != nil {
+			continue
+		}
+		for _, b := range list {
+			if b.Location != "local" {
+				continue
+			}
+			if err := e.upload(ctx, remote, name, b.File); err != nil {
+				e.noteRemote(err)
+				return n, err
+			}
+			n++
+		}
+	}
+	e.noteRemote(nil)
+	return n, nil
+}
+
+// pruneBackups removes the oldest scheduled backups beyond keep, locally and
+// remotely. Manual backups are never removed automatically.
+func (e *Engine) pruneBackups(ctx context.Context, name string, keep int) {
+	all, err := e.Backups(ctx, name)
 	if err != nil {
 		return
 	}
@@ -182,15 +298,27 @@ func (e *Engine) pruneBackups(name string, keep int) {
 			continue
 		}
 		if n++; n > keep {
-			if path, err := e.backupPath(name, b.ID); err == nil {
-				os.Remove(path)
+			if err := e.removeBackup(ctx, name, b); err != nil {
+				e.Log.Warn("cannot prune backup", "app", name, "id", b.ID, "err", err)
 			}
 		}
 	}
 }
 
-// Backups lists a database's stored backups, newest first.
-func (e *Engine) Backups(name string) ([]api.Backup, error) {
+func parseBackupFile(name, file string) (api.Backup, bool) {
+	id, _, ok := strings.Cut(file, ".")
+	m := backupIDRe.FindStringSubmatch(id)
+	if !ok || m == nil || !strings.HasSuffix(file, ".gz") {
+		return api.Backup{}, false
+	}
+	created, _ := time.Parse("20060102T150405Z", m[1])
+	return api.Backup{ID: id, App: name, File: file, Kind: m[2], CreatedAt: created}, true
+}
+
+// Backups lists a database's backups, newest first: the ones on this server
+// merged with the ones in remote storage. That makes backups of a lost
+// server visible on its replacement as soon as the storage is configured.
+func (e *Engine) Backups(ctx context.Context, name string) ([]api.Backup, error) {
 	a, err := e.Store.App(name)
 	if err != nil {
 		return nil, err
@@ -203,26 +331,45 @@ func (e *Engine) Backups(name string) ([]api.Backup, error) {
 	if err != nil && !os.IsNotExist(err) {
 		return nil, err
 	}
-	out := []api.Backup{}
+	byID := map[string]*api.Backup{}
 	for _, en := range entries {
-		id, _, ok := strings.Cut(en.Name(), ".")
-		m := backupIDRe.FindStringSubmatch(id)
-		if !ok || m == nil || !strings.HasSuffix(en.Name(), ".gz") {
+		b, ok := parseBackupFile(name, en.Name())
+		info, ierr := en.Info()
+		if !ok || ierr != nil {
 			continue
 		}
-		info, err := en.Info()
+		b.Engine, b.Size, b.Location = engine, info.Size(), "local"
+		byID[b.ID] = &b
+	}
+	if remote := e.remote(); remote != nil {
+		objs, err := remote.List(ctx, name+"/")
+		e.noteRemote(err)
 		if err != nil {
-			continue
+			e.Log.Warn("cannot list remote backups", "app", name, "err", err)
 		}
-		created, _ := time.Parse("20060102T150405Z", m[1])
-		out = append(out, api.Backup{ID: id, App: name, Kind: m[2], Engine: engine, Size: info.Size(), CreatedAt: created})
+		for _, o := range objs {
+			b, ok := parseBackupFile(name, strings.TrimPrefix(o.Key, name+"/"))
+			if !ok {
+				continue
+			}
+			if local := byID[b.ID]; local != nil {
+				local.Location = "local+s3"
+				continue
+			}
+			b.Engine, b.Size, b.Location = engine, o.Size, "s3"
+			byID[b.ID] = &b
+		}
+	}
+	out := make([]api.Backup, 0, len(byID))
+	for _, b := range byID {
+		out = append(out, *b)
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].ID > out[j].ID })
 	return out, nil
 }
 
-func (e *Engine) backup(name, id string) (*api.Backup, error) {
-	all, err := e.Backups(name)
+func (e *Engine) backup(ctx context.Context, name, id string) (*api.Backup, error) {
+	all, err := e.Backups(ctx, name)
 	if err != nil {
 		return nil, err
 	}
@@ -238,45 +385,61 @@ func (e *Engine) backup(name, id string) (*api.Backup, error) {
 		WithHint("List backups with `saba db backup list %s`.", name)
 }
 
-func (e *Engine) backupPath(name, id string) (string, error) {
-	b, err := e.backup(name, id)
+// OpenBackup opens a backup (gzip-compressed) for reading: the local copy if
+// there is one, otherwise a stream from remote storage.
+func (e *Engine) OpenBackup(ctx context.Context, name, id string) (io.ReadCloser, *api.Backup, error) {
+	b, err := e.backup(ctx, name, id)
 	if err != nil {
-		return "", err
+		return nil, nil, err
 	}
-	matches, _ := filepath.Glob(filepath.Join(e.backupDir(name), b.ID+".*.gz"))
-	if len(matches) == 0 {
-		return "", api.Errorf(api.CodeNotFound, "backup %q is missing on disk", id)
+	if strings.HasPrefix(b.Location, "local") {
+		f, err := os.Open(filepath.Join(e.backupDir(name), b.File))
+		if err == nil {
+			return f, b, nil
+		}
 	}
-	return matches[0], nil
+	remote := e.remote()
+	if remote == nil {
+		return nil, nil, api.Errorf(api.CodeNotFound, "backup %q is missing on disk", id)
+	}
+	body, size, err := remote.Get(ctx, name+"/"+b.File)
+	if err != nil {
+		return nil, nil, api.Errorf(api.CodeRuntime, "cannot fetch backup %s from S3: %v", b.ID, err)
+	}
+	if size > 0 {
+		b.Size = size
+	}
+	return body, b, nil
 }
 
-// OpenBackup opens a stored backup (gzip-compressed) for download.
-func (e *Engine) OpenBackup(name, id string) (*os.File, *api.Backup, error) {
-	b, err := e.backup(name, id)
-	if err != nil {
-		return nil, nil, err
+func (e *Engine) removeBackup(ctx context.Context, name string, b api.Backup) error {
+	if strings.Contains(b.Location, "s3") {
+		remote := e.remote()
+		if remote == nil {
+			return api.Errorf(api.CodeRuntime, "backup %s is in S3, but no S3 storage is configured", b.ID)
+		}
+		if err := remote.Delete(ctx, name+"/"+b.File); err != nil {
+			return api.Errorf(api.CodeRuntime, "cannot delete backup %s from S3: %v", b.ID, err)
+		}
 	}
-	path, err := e.backupPath(name, b.ID)
-	if err != nil {
-		return nil, nil, err
+	if strings.HasPrefix(b.Location, "local") {
+		if err := os.Remove(filepath.Join(e.backupDir(name), b.File)); err != nil && !os.IsNotExist(err) {
+			return err
+		}
 	}
-	f, err := os.Open(path)
-	if err != nil {
-		return nil, nil, err
-	}
-	return f, b, nil
+	return nil
 }
 
-// DeleteBackup removes a stored backup.
-func (e *Engine) DeleteBackup(name, id string) error {
+// DeleteBackup removes a backup everywhere it is stored.
+func (e *Engine) DeleteBackup(ctx context.Context, name, id string) error {
 	if id == "latest" {
 		return api.Errorf(api.CodeInvalid, "name the backup to delete by its id")
 	}
-	path, err := e.backupPath(name, id)
+	b, err := e.backup(ctx, name, id)
 	if err != nil {
 		return err
 	}
-	return os.Remove(path)
+	return e.removeBackup(ctx, name, *b)
 }
 
 // Restore loads a dump into a database. The input may be gzip-compressed.
@@ -318,14 +481,14 @@ func (e *Engine) Restore(ctx context.Context, name string, r io.Reader) error {
 	return nil
 }
 
-// RestoreBackup restores a backup stored on the server.
+// RestoreBackup restores a stored backup, from this server or from remote storage.
 func (e *Engine) RestoreBackup(ctx context.Context, name, id string) (*api.Backup, error) {
-	f, b, err := e.OpenBackup(name, id)
+	r, b, err := e.OpenBackup(ctx, name, id)
 	if err != nil {
 		return nil, err
 	}
-	defer f.Close()
-	return b, e.Restore(ctx, name, f)
+	defer r.Close()
+	return b, e.Restore(ctx, name, r)
 }
 
 // SetBackupPolicy enables, changes or (with an empty schedule) disables

@@ -230,3 +230,47 @@ func TestCrossNodeNameResolution(t *testing.T) {
 		t.Fatalf("on the same server Docker's DNS is used, got %v", got)
 	}
 }
+
+// In direct mode the primary reaches replicas on the node's private address;
+// no tunnel is opened.
+func TestDirectNodeBypassesTheTunnel(t *testing.T) {
+	h := newHarness(t)
+	nodes := withNodes(t, h, "w1")
+	if err := h.engine.Store.Update(func(st *store.State) error {
+		st.Nodes["w1"].Address, st.Nodes["w1"].Direct = "127.0.0.2", true
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	req := image("ok:1")
+	req.Config = map[string]any{"replicas": 4, "nodes": []any{"local", "w1"}}
+	res := h.mustDeploy("web", req)
+	for _, r := range res.Deployment.Replicas {
+		wantAddr := ""
+		if r.Node == "w1" {
+			wantAddr = "127.0.0.2"
+		}
+		if r.Addr != wantAddr {
+			t.Fatalf("replica %d on %q is published on %q, want %q", r.Index, r.Node, r.Addr, wantAddr)
+		}
+	}
+	if nodes.open() != 0 {
+		t.Fatalf("direct mode must not open tunnels, have %d", nodes.open())
+	}
+	for i := 0; i < 8; i++ {
+		if code, body := h.get("web.test", "/"); code != 200 || body != "ok v1" {
+			t.Fatalf("request %d: %d %q", i, code, body)
+		}
+	}
+	// Switching the node back to the tunnel takes effect on the next rollout.
+	if err := h.engine.Store.Update(func(st *store.State) error { st.Nodes["w1"].Direct = false; return nil }); err != nil {
+		t.Fatal(err)
+	}
+	h.mustDeploy("web", api.DeployRequest{Source: api.Source{Type: "current"}})
+	if nodes.open() != 2 {
+		t.Fatalf("after switching to tunnel mode each remote replica needs a tunnel, have %d", nodes.open())
+	}
+	if code, _ := h.get("web.test", "/"); code != 200 {
+		t.Fatalf("after switching modes: %d", code)
+	}
+}

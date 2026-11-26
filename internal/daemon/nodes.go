@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"context"
+	"net"
 	"net/http"
 	"sort"
 	"strings"
@@ -92,6 +93,20 @@ func (d *Daemon) handleNodeAdd(w http.ResponseWriter, r *http.Request) error {
 	n.SSH = strings.TrimSpace(n.SSH)
 	if n.SSH == "" || strings.HasPrefix(n.SSH, "-") {
 		return api.Errorf(api.CodeInvalid, "an SSH destination is required").WithHint("Example: `saba node add worker1 root@10.0.0.2`.")
+	}
+	n.Address = strings.TrimSpace(n.Address)
+	if n.Direct {
+		ip := net.ParseIP(n.Address)
+		cgnat := ip != nil && ip.To4() != nil && ip.To4()[0] == 100 && ip.To4()[1]&0xc0 == 64
+		switch {
+		case ip == nil:
+			return api.Errorf(api.CodeInvalid, "--direct needs the node's private IP address").
+				WithHint("Example: `saba node add %s %s --address 10.0.0.2 --direct`.", n.Name, n.SSH)
+		case !ip.IsPrivate() && !ip.IsLoopback() && !cgnat:
+			// Direct traffic is plain HTTP and the replica ports are open on that address.
+			return api.Errorf(api.CodeInvalid, "%s is a public address; direct mode is only safe on a private network", n.Address).
+				WithHint("Use the node's private address (10.x, 172.16-31.x, 192.168.x, or a 100.64.x VPN address), or leave --direct out to keep the encrypted SSH tunnel.")
+		}
 	}
 	n.CreatedAt = time.Now().UTC()
 	n.Status, n.Error, n.Docker, n.Replicas = "", "", "", 0
