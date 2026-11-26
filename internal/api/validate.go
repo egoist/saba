@@ -141,6 +141,23 @@ func (c *AppConfig) Validate() error {
 			return Errorf(CodeInvalid, "invalid publish spec %q", p).WithHint("Use \"hostPort:containerPort\", e.g. \"5432:5432\".")
 		}
 	}
+	seenNode := map[string]bool{}
+	nodes := c.Nodes[:0:0]
+	for _, n := range c.Nodes {
+		n = strings.TrimSpace(n)
+		if n != "*" && !nameRe.MatchString(n) {
+			return Errorf(CodeInvalid, "invalid node name %q", n).WithHint("Use node names from `saba node list`, or \"*\" for all nodes.")
+		}
+		if !seenNode[n] {
+			seenNode[n] = true
+			nodes = append(nodes, n)
+		}
+	}
+	c.Nodes = nodes
+	if len(c.Volumes) > 0 && (len(c.Nodes) > 1 || seenNode["*"]) {
+		return Errorf(CodeInvalid, "an app with volumes cannot be spread across nodes").
+			WithHint("Volumes live on one server. Pin the app to a single node, e.g. nodes = [\"local\"].")
+	}
 	if len(c.Publish) > 0 && c.Replicas > 1 {
 		return Errorf(CodeInvalid, "publish cannot be combined with more than one replica").
 			WithHint("A host port can only be bound by one container. Remove `publish` or set replicas to 1.")

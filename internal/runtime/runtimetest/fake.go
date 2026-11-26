@@ -28,6 +28,9 @@ type Fake struct {
 	mu         sync.Mutex
 	containers map[string]*fakeContainer
 	images     map[string]string // tag → behaviour
+	ids        map[string]string // tag → image id (shared by retagged copies)
+	// Loads counts images received through LoadImage.
+	Loads int
 	// RunOnceFunc, if set, decides the exit code of one-off runs.
 	RunOnceFunc func(opts runtime.RunOptions) int
 }
@@ -37,10 +40,30 @@ type fakeContainer struct {
 	opts   runtime.RunOptions
 	server *http.Server
 	logs   []string
+	data   string // what a "dump" returns and a "restore" replaces
+}
+
+// SetData sets the data a container returns for dump commands.
+func (f *Fake) SetData(name, data string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if c, ok := f.containers[name]; ok {
+		c.data = data
+	}
+}
+
+// Data returns a container's current data.
+func (f *Fake) Data(name string) string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if c, ok := f.containers[name]; ok {
+		return c.data
+	}
+	return ""
 }
 
 func New() *Fake {
-	return &Fake{containers: map[string]*fakeContainer{}, images: map[string]string{}}
+	return &Fake{containers: map[string]*fakeContainer{}, images: map[string]string{}, ids: map[string]string{}}
 }
 
 var _ runtime.Runtime = (*Fake)(nil)
@@ -58,6 +81,7 @@ func (f *Fake) Pull(_ context.Context, image string, out io.Writer) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.images[image] = strings.Split(image, ":")[0]
+	f.ids[image] = "sha-" + image
 	fmt.Fprintf(out, "Status: Downloaded %s\n", image)
 	return nil
 }
@@ -66,6 +90,7 @@ func (f *Fake) Build(_ context.Context, o runtime.BuildOptions, out io.Writer) e
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.images[o.Tag] = "ok"
+	f.ids[o.Tag] = "sha-" + o.Tag
 	fmt.Fprintln(out, "built "+o.Tag)
 	return nil
 }
@@ -73,20 +98,62 @@ func (f *Fake) Build(_ context.Context, o runtime.BuildOptions, out io.Writer) e
 func (f *Fake) InspectImage(_ context.Context, ref string) (*runtime.Image, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if _, ok := f.images[ref]; !ok {
-		return nil, runtime.ErrNotFound
+	if _, ok := f.images[ref]; ok {
+		return &runtime.Image{ID: f.ids[ref], ExposedPorts: []int{8080}}, nil
 	}
-	return &runtime.Image{ID: ref, ExposedPorts: []int{8080}}, nil
+	for _, id := range f.ids { // lookup by image id
+		if id == ref {
+			return &runtime.Image{ID: id, ExposedPorts: []int{8080}}, nil
+		}
+	}
+	return nil, runtime.ErrNotFound
+}
+
+// SaveImage and LoadImage carry the tag and behaviour as a tiny text archive.
+func (f *Fake) SaveImage(_ context.Context, ref string, w io.Writer) error {
+	f.mu.Lock()
+	b, ok := f.images[ref]
+	f.mu.Unlock()
+	if !ok {
+		return runtime.ErrNotFound
+	}
+	_, err := fmt.Fprintf(w, "%s\n%s\n%s", ref, b, f.ids[ref])
+	return err
+}
+
+func (f *Fake) LoadImage(_ context.Context, r io.Reader) error {
+	b, err := io.ReadAll(r)
+	if err != nil {
+		return err
+	}
+	parts := strings.Split(string(b), "\n")
+	if len(parts) != 3 {
+		return fmt.Errorf("invalid image archive")
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.images[parts[0]] = parts[1]
+	f.ids[parts[0]] = parts[2]
+	f.Loads++
+	return nil
 }
 
 func (f *Fake) TagImage(_ context.Context, src, dst string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if _, ok := f.images[src]; !ok {
+		for tag, id := range f.ids { // src may be an image id
+			if id == src {
+				src = tag
+			}
+		}
+	}
 	b, ok := f.images[src]
 	if !ok {
 		return runtime.ErrNotFound
 	}
 	f.images[dst] = b
+	f.ids[dst] = f.ids[src]
 	return nil
 }
 
@@ -94,6 +161,7 @@ func (f *Fake) RemoveImage(_ context.Context, ref string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	delete(f.images, ref)
+	delete(f.ids, ref)
 	return nil
 }
 
@@ -271,12 +339,37 @@ func (f *Fake) Logs(_ context.Context, name string, _ runtime.LogOptions, fn fun
 	return nil
 }
 
-func (f *Fake) Exec(_ context.Context, name string, cmd []string, stdout, _ io.Writer) (int, error) {
+// Exec emulates a few commands: anything given stdin stores it as the
+// container's data (a restore); a command mentioning "dump" prints that data;
+// "false" exits 1; everything else echoes its argv.
+func (f *Fake) Exec(_ context.Context, name string, cmd []string, stdin io.Reader, stdout, stderr io.Writer) (int, error) {
 	f.mu.Lock()
-	_, ok := f.containers[name]
+	c, ok := f.containers[name]
 	f.mu.Unlock()
 	if !ok {
 		return -1, runtime.ErrNotFound
+	}
+	line := strings.Join(cmd, " ")
+	if stdin != nil {
+		b, err := io.ReadAll(stdin)
+		if err != nil {
+			return -1, err
+		}
+		if strings.Contains(string(b), "CORRUPT") {
+			fmt.Fprintln(stderr, "ERROR: syntax error in dump")
+			return 3, nil
+		}
+		f.mu.Lock()
+		c.data = string(b)
+		f.mu.Unlock()
+		return 0, nil
+	}
+	if strings.Contains(line, "dump") {
+		f.mu.Lock()
+		data := c.data
+		f.mu.Unlock()
+		fmt.Fprint(stdout, data)
+		return 0, nil
 	}
 	fmt.Fprintf(stdout, "exec %s\n", strings.Join(cmd, " "))
 	if len(cmd) > 0 && cmd[0] == "false" {
@@ -304,6 +397,7 @@ func (f *Fake) AddImage(tag, behaviour string) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.images[tag] = behaviour
+	f.ids[tag] = "sha-" + tag
 }
 
 // SetRunOnce sets RunOnceFunc safely while containers are running.

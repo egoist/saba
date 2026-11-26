@@ -148,7 +148,10 @@ var dbEngines = map[string]dbEngine{
 			return map[string]any{
 					"port":    27017,
 					"volumes": []string{"data:/data/db"},
-					"health":  map[string]any{"command": `mongosh --quiet --eval "db.adminCommand('ping').ok"`, "timeout": "120s"},
+					// While initializing, mongod runs without auth on 127.0.0.1 only and
+					// then restarts. Ready means: reachable on the container's own
+					// address, with the root credentials.
+					"health": map[string]any{"command": `mongosh --quiet --host "$(hostname)" -u "$MONGO_INITDB_ROOT_USERNAME" -p "$MONGO_INITDB_ROOT_PASSWORD" --authenticationDatabase admin --eval "db.adminCommand('ping').ok"`, "timeout": "120s"},
 				},
 				map[string]string{"MONGO_INITDB_ROOT_USERNAME": "root", "MONGO_INITDB_ROOT_PASSWORD": pw},
 				map[string]string{"URL": fmt.Sprintf("mongodb://root:%s@%s:27017/%s?authSource=admin", pw, name, db),
@@ -178,11 +181,13 @@ Supported engines: ` + engineNames() + `.`,
 		Example: `  saba db create main --engine postgres
   saba db link main -a api            # sets DATABASE_URL on api and redeploys it
   saba db url main                    # print the connection URL
-  saba exec -a main -- pg_dump -U postgres main > backup.sql
-  saba destroy main --yes --volumes   # delete it, including data`,
+  saba db backup schedule main @daily # automatic backups, newest 7 kept
+  saba db backup create main -o main.sql.gz
+  saba db restore main --backup latest --yes
+  saba destroy main --yes --volumes   # delete it, including data and backups`,
 	}
 
-	var engine, version, publish, memory string
+	var engine, version, publish, memory, node string
 	create := &cobra.Command{
 		Use:   "create <name>",
 		Short: "Create a database",
@@ -212,6 +217,9 @@ Supported engines: ` + engineNames() + `.`,
 			}
 			if memory != "" {
 				cfg["resources"] = map[string]any{"memory": memory}
+			}
+			if node != "" {
+				cfg["nodes"] = []string{node}
 			}
 			req := api.DeployRequest{
 				Source:     api.Source{Type: "image", Image: eng.image + ":" + version},
@@ -248,6 +256,7 @@ Supported engines: ` + engineNames() + `.`,
 	create.Flags().StringVar(&version, "version", "", "Image tag of the engine (default: a current stable release)")
 	create.Flags().StringVar(&publish, "publish", "", "Also expose the database on the host, e.g. 5432:5432 (not recommended)")
 	create.Flags().StringVar(&memory, "memory", "", "Memory limit (e.g. 1g)")
+	create.Flags().StringVar(&node, "node", "", "Server to run the database on (default: the primary)")
 
 	list := &cobra.Command{
 		Use: "list", Aliases: []string{"ls"}, Short: "List databases", Args: maxArgs(0),
@@ -343,6 +352,7 @@ deploy time, so the app never stores a copy of the credentials.`,
 	link.Flags().BoolVar(&noDeploy, "no-deploy", false, "Save the variable without rolling out the app")
 
 	cmd.AddCommand(create, list, url, link)
+	cmd.AddCommand(c.dbBackupCmds()...)
 	return cmd
 }
 

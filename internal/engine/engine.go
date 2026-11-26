@@ -46,9 +46,11 @@ const (
 )
 
 type Engine struct {
-	Store   *store.Store
-	RT      runtime.Runtime
-	Proxy   *proxy.Proxy
+	Store *store.Store
+	RT    runtime.Runtime
+	Proxy *proxy.Proxy
+	// Nodes connects to the cluster's other servers; nil on a single server.
+	Nodes   Nodes
 	DataDir string
 	Log     *slog.Logger
 	// PortMin/PortMax bound the loopback ports replicas are published on.
@@ -61,11 +63,12 @@ type Engine struct {
 	TLS       bool
 	URLSuffix string
 
-	wg         sync.WaitGroup // in-flight deployments, including their cleanup
-	mu         sync.Mutex
-	busy       map[string]*Run
-	logs       map[string]*EventLog
-	portCursor int
+	backupLocks map[string]*sync.Mutex // one backup or restore per database at a time
+	wg          sync.WaitGroup         // in-flight deployments, including their cleanup
+	mu          sync.Mutex
+	busy        map[string]*Run
+	logs        map[string]*EventLog
+	portCursor  int
 }
 
 func New(st *store.Store, rt runtime.Runtime, px *proxy.Proxy, dataDir string, log *slog.Logger) *Engine {

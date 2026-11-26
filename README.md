@@ -47,13 +47,16 @@ $ cd my-app && saba deploy
 | Rollouts | Rolling (default) or recreate; health-gated; release commands for migrations |
 | Rollbacks | `saba rollback` restores image, config and environment of a previous version |
 | HTTPS | Automatic Let's Encrypt certificates for every routed domain; instant `sslip.io` URLs |
-| Scaling | `saba scale web 3` — replicas are load-balanced by the built-in proxy |
+| Wildcards | Wildcard certificates through DNS-01 (Cloudflare built in, a hook for any other DNS host); bring your own certificates |
+| Scaling | `saba scale web 3` — replicas are load-balanced by the built-in proxy, on one server or spread across several |
 | Config | Declarative `saba.toml`, or flags that the server remembers |
 | Secrets | `saba env set`, with `${{db.URL}}`-style references between apps |
 | Databases | Postgres, MySQL, MariaDB, Redis, MongoDB with volumes and generated credentials |
+| Backups | On-demand and scheduled database backups with retention, download and restore |
 | Cron | Scheduled commands in the app's image |
 | Operations | Logs, exec, one-off runs, stats, `saba doctor` diagnostics |
-| Multi-server | Named contexts; pin a project to a server in `saba.toml` |
+| Upgrades | The daemon restarts without refusing or dropping requests (systemd socket activation) |
+| Multi-server | Add worker nodes over SSH; named contexts for separate environments |
 
 ## Install
 
@@ -114,12 +117,50 @@ saba status                       # what is running
 saba logs -f                      # tail logs
 saba env set STRIPE_KEY=sk_...    # set a secret and roll it out
 saba db create main --engine postgres && saba db link main -a api
+saba db backup schedule main @daily   # automatic backups, newest 7 kept
 saba scale 3
 saba rollback                     # something went wrong
 saba doctor                       # why is something wrong
 ```
 
 Run `saba --help`, `saba <command> --help` or `saba guide` for everything else.
+
+## Scaling across servers
+
+One server is the primary: it runs the saba daemon, terminates HTTPS and load-balances. Any
+other Linux box with Docker becomes a worker node — nothing to install on it, no ports to open:
+
+```sh
+saba node add worker1 root@10.0.0.2
+saba deploy -a web --node local --node worker1 --replicas 4    # 2 replicas per server
+```
+
+or in `saba.toml`: `nodes = ["local", "worker1"]` (`["*"]` means every server).
+
+The primary drives each node's Docker engine and reaches its replicas through one persistent
+SSH connection, so traffic between servers is encrypted and needs no private network. Rolling
+deploys, rollbacks, logs, exec and stats work the same across servers. If a node goes down, its
+replicas drop out of rotation and come back on their own when it returns.
+
+Two things stay per-server: volumes (apps with volumes and databases run on one node), and
+container names — `http://api:8080` resolves between containers on the same server. An app that
+publishes a port (`publish = ["10.0.0.1:5432:5432"]`) is also reachable by name from other
+nodes, at its server's address (`saba node add --address`, `saba server config set address`).
+
+## Certificates
+
+Every routed domain gets a Let's Encrypt certificate on its first request, with nothing to
+configure. Wildcard certificates need the DNS-01 challenge, so saba needs access to your DNS:
+
+```sh
+saba server config set cloudflare_api_token -      # reads the token from stdin
+saba server config set base_domain apps.example.com
+```
+
+saba then obtains and renews `*.apps.example.com` (new apps get HTTPS instantly, with no
+per-app issuance) and a certificate for every wildcard domain routed to an app. For other DNS
+hosts, point `dns_hook` at a script that creates and removes the TXT record. To use a
+certificate from elsewhere: `saba certs add --cert fullchain.pem --key privkey.pem`.
 
 ## For AI agents
 
@@ -161,7 +202,11 @@ An [MCP](https://modelcontextprotocol.io) server exposes the same operations as 
 
 - Every deployment gets a version number and its own containers
   (`saba-<app>-v<N>-<replica>`), published on a loopback port that only the proxy uses.
-- State is one JSON file (`/var/lib/saba/state.json`); deployment logs are kept next to it.
+- State is one JSON file (`/var/lib/saba/state.json`); deployment logs and database backups
+  are kept next to it.
+- Ports 80 and 443 belong to systemd and are handed to the daemon (socket activation). While
+  the daemon restarts, connections wait in the kernel and in-flight requests finish first, so
+  upgrading saba does not drop traffic.
 - Apps share a private Docker network and reach each other by name (`http://api:8080`).
 - Containers are owned by Docker with a restart policy, so apps survive daemon restarts and
   host reboots.
@@ -190,11 +235,14 @@ curl http://hello.localhost:8080
 
 saba is new. Known limitations:
 
-- One server per app; there is no clustering or multi-node scheduling.
-- Restarting the daemon (for example when upgrading saba) interrupts the proxy for a moment.
-  App containers keep running.
-- Certificates use the HTTP-01/TLS-ALPN-01 challenges, so wildcard certificates are not issued;
-  each hostname under a wildcard domain gets its own certificate on first use.
+- The primary is a single point of failure: it terminates all traffic and holds the state.
+  Worker nodes add capacity, not redundancy for the primary itself.
+- Traffic to replicas on other servers goes through an SSH tunnel. That keeps setup trivial and
+  encrypted, at some cost in throughput compared to a private network link.
+- Volumes are per-server and containers find each other by name only on the same server (see
+  "Scaling across servers").
+- Database backups are stored on the server that runs saba. Copy them elsewhere for disaster
+  recovery (`saba db backup create <db> -o <file>` from another machine). Redis is not
+  supported by the backup commands.
 - Anyone who can SSH in as root or as a member of the `docker` group can control saba. There
-  are no per-user permissions.
-- Database backups are manual (`saba exec -a db -- pg_dump ...`).
+  are no per-user permissions; access control is SSH.

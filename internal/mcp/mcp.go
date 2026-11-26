@@ -159,6 +159,7 @@ func tools() []tool {
 				"domains":         strs("Domains to route to the app (replaces the list)."),
 				"env":             strMap("Environment variables to set."),
 				"replicas":        num("Number of containers."),
+				"nodes":           strs("Servers to spread replicas across: \"local\", node names from saba_nodes, or \"*\" for all."),
 				"health_path":     str("HTTP path that must return 2xx/3xx before traffic is switched."),
 				"release_command": str("Command run to completion before the new version gets traffic (e.g. migrations)."),
 				"message":         str("Note to attach to the deployment."),
@@ -183,6 +184,9 @@ func tools() []tool {
 				}
 				for _, d := range getStrs(in, "domains") {
 					args = append(args, "--domain", d)
+				}
+				for _, n := range getStrs(in, "nodes") {
+					args = append(args, "--node", n)
 				}
 				for _, kv := range getMap(in, "env") {
 					args = append(args, "--env", kv)
@@ -381,6 +385,50 @@ func tools() []tool {
 				}
 				return args, nil
 			},
+		},
+		{
+			Name:        "saba_db_backup",
+			Description: "Back up a managed database now. The compressed dump is stored on the server; returns its id and size.",
+			Props:       schema{"database": str("Database name.")}, Required: []string{"database"},
+			Args: func(in map[string]any) ([]string, error) {
+				return []string{"db", "backup", "create", getStr(in, "database")}, nil
+			},
+		},
+		{
+			Name: "saba_db_backups", ReadOnly: true,
+			Description: "List the stored backups of a managed database, newest first.",
+			Props:       schema{"database": str("Database name.")}, Required: []string{"database"},
+			Args: func(in map[string]any) ([]string, error) {
+				return []string{"db", "backup", "list", getStr(in, "database")}, nil
+			},
+		},
+		{
+			Name: "saba_db_restore", Destructive: true,
+			Description: "Restore a managed database from one of its stored backups, replacing its current data. Only call when the user explicitly asked for a restore.",
+			Props: schema{
+				"database": str("Database name."),
+				"backup":   str("Backup id from saba_db_backups, or \"latest\"."),
+				"confirm":  flag("Must be true."),
+			},
+			Required: []string{"database", "backup", "confirm"},
+			Args: func(in map[string]any) ([]string, error) {
+				if !getBool(in, "confirm") {
+					return nil, fmt.Errorf("set confirm to true to replace the data of %q with the backup", getStr(in, "database"))
+				}
+				return []string{"db", "restore", getStr(in, "database"), "--backup", getStr(in, "backup"), "--yes"}, nil
+			},
+		},
+		{
+			Name: "saba_nodes", ReadOnly: true,
+			Description: "List the servers of the cluster (the primary \"local\" and added nodes) with connection status and replica counts. Use node names in saba_deploy's `nodes`.",
+			Props:       schema{},
+			Args:        func(map[string]any) ([]string, error) { return []string{"node", "list"}, nil },
+		},
+		{
+			Name: "saba_certs", ReadOnly: true,
+			Description: "List wildcard and custom TLS certificates with status and expiry. Regular domains get certificates automatically and are not listed.",
+			Props:       schema{},
+			Args:        func(map[string]any) ([]string, error) { return []string{"certs", "list"}, nil },
 		},
 		{
 			Name: "saba_doctor", ReadOnly: true,

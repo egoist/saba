@@ -30,6 +30,8 @@ type RunOptions struct {
 	// Restart policy ("unless-stopped", "no", ...).
 	Restart     string
 	StopTimeout time.Duration
+	// ExtraHosts are "name:address" entries added to the container's /etc/hosts.
+	ExtraHosts []string
 }
 
 type BuildOptions struct {
@@ -42,6 +44,8 @@ type BuildOptions struct {
 }
 
 type Container struct {
+	// Node is set by multi-node listings; empty means the primary.
+	Node      string
 	ID        string
 	Name      string
 	Image     string
@@ -93,6 +97,9 @@ type Runtime interface {
 	InspectImage(ctx context.Context, ref string) (*Image, error)
 	TagImage(ctx context.Context, src, dst string) error
 	RemoveImage(ctx context.Context, ref string) error
+	// SaveImage and LoadImage move an image between engines without a registry.
+	SaveImage(ctx context.Context, ref string, w io.Writer) error
+	LoadImage(ctx context.Context, r io.Reader) error
 
 	// Run starts a detached container and returns its ID.
 	Run(ctx context.Context, opts RunOptions) (string, error)
@@ -107,7 +114,8 @@ type Runtime interface {
 	Inspect(ctx context.Context, name string) (*Container, error)
 	List(ctx context.Context, labels map[string]string) ([]Container, error)
 	Logs(ctx context.Context, name string, opts LogOptions, fn func(LogLine)) error
-	Exec(ctx context.Context, name string, cmd []string, stdout, stderr io.Writer) (int, error)
+	// Exec runs a command in a running container. stdin may be nil.
+	Exec(ctx context.Context, name string, cmd []string, stdin io.Reader, stdout, stderr io.Writer) (int, error)
 	Stats(ctx context.Context, names []string) ([]Stat, error)
 
 	RemoveVolume(ctx context.Context, name string) error

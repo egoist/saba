@@ -29,7 +29,30 @@ type ServerOptions struct {
 	Email string
 	// ACMEDirectory overrides the ACME endpoint (e.g. Let's Encrypt staging).
 	ACMEDirectory string
+	// HTTPListener and HTTPSListener are already-bound sockets (systemd socket
+	// activation). When nil, the addresses above are bound instead.
+	HTTPListener  net.Listener
+	HTTPSListener net.Listener
+	// Certs, if set, is consulted before on-demand issuance: it returns a
+	// stored certificate (custom or wildcard) for a server name, or nil.
+	Certs func(serverName string) *tls.Certificate
+	// ACMEClient overrides the HTTP client used to talk to the CA.
+	ACMEClient *http.Client
 }
+
+func listen(inherited net.Listener, addr string) (net.Listener, error) {
+	if inherited != nil {
+		return inherited, nil
+	}
+	l, err := net.Listen("tcp", addr)
+	if err != nil {
+		return nil, fmt.Errorf("cannot listen on %s: %w", addr, err)
+	}
+	return l, nil
+}
+
+// ShutdownGrace is how long in-flight requests may finish when the proxy stops.
+const ShutdownGrace = 30 * time.Second
 
 // Server owns the proxy's listeners.
 type Server struct {
@@ -59,8 +82,11 @@ func (p *Proxy) Listen(opts ServerOptions) (*Server, error) {
 				return fmt.Errorf("saba: host %q is not routed to any app", host)
 			},
 		}
-		if opts.ACMEDirectory != "" {
-			mgr.Client = &acme.Client{DirectoryURL: opts.ACMEDirectory}
+		if opts.ACMEDirectory != "" || opts.ACMEClient != nil {
+			mgr.Client = &acme.Client{DirectoryURL: opts.ACMEDirectory, HTTPClient: opts.ACMEClient}
+			if opts.ACMEDirectory == "" {
+				mgr.Client.DirectoryURL = acme.LetsEncryptURL
+			}
 		}
 		// Redirects must keep a non-standard HTTPS port.
 		if _, port, err := net.SplitHostPort(opts.HTTPSAddr); err == nil && port != "443" {
@@ -68,6 +94,19 @@ func (p *Proxy) Listen(opts ServerOptions) (*Server, error) {
 		}
 		tlsConf := mgr.TLSConfig()
 		tlsConf.MinVersion = tls.VersionTLS12
+		if opts.Certs != nil {
+			onDemand := tlsConf.GetCertificate
+			tlsConf.GetCertificate = func(hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
+				// ACME TLS-ALPN-01 validation handshakes must reach autocert.
+				alpn := len(hello.SupportedProtos) == 1 && hello.SupportedProtos[0] == acme.ALPNProto
+				if !alpn && p.HasHost(hello.ServerName) {
+					if c := opts.Certs(hello.ServerName); c != nil {
+						return c, nil
+					}
+				}
+				return onDemand(hello)
+			}
+		}
 		s.https = &http.Server{
 			Handler:           hsts(p),
 			TLSConfig:         tlsConf,
@@ -75,9 +114,9 @@ func (p *Proxy) Listen(opts ServerOptions) (*Server, error) {
 			IdleTimeout:       120 * time.Second,
 			ErrorLog:          quietLog(p),
 		}
-		l, err := net.Listen("tcp", opts.HTTPSAddr)
+		l, err := listen(opts.HTTPSListener, opts.HTTPSAddr)
 		if err != nil {
-			return nil, fmt.Errorf("cannot listen on %s: %w", opts.HTTPSAddr, err)
+			return nil, err
 		}
 		s.tlsL = l
 		httpHandler = mgr.HTTPHandler(http.HandlerFunc(p.redirectHTTPS))
@@ -89,12 +128,12 @@ func (p *Proxy) Listen(opts ServerOptions) (*Server, error) {
 		IdleTimeout:       120 * time.Second,
 		ErrorLog:          quietLog(p),
 	}
-	l, err := net.Listen("tcp", opts.HTTPAddr)
+	l, err := listen(opts.HTTPListener, opts.HTTPAddr)
 	if err != nil {
 		if s.tlsL != nil {
 			s.tlsL.Close()
 		}
-		return nil, fmt.Errorf("cannot listen on %s: %w", opts.HTTPAddr, err)
+		return nil, err
 	}
 	s.httpL = l
 	return s, nil
@@ -118,12 +157,21 @@ func (s *Server) Serve(ctx context.Context) error {
 		return err
 	case <-ctx.Done():
 	}
-	shutCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	// Stop accepting and let in-flight requests finish. Under socket
+	// activation new connections queue in the kernel meanwhile and are served
+	// by the next daemon process.
+	shutCtx, cancel := context.WithTimeout(context.Background(), ShutdownGrace)
 	defer cancel()
-	_ = s.http.Shutdown(shutCtx)
-	if s.https != nil {
-		_ = s.https.Shutdown(shutCtx)
-	}
+	done := make(chan struct{}, 2)
+	go func() { _ = s.http.Shutdown(shutCtx); done <- struct{}{} }()
+	go func() {
+		if s.https != nil {
+			_ = s.https.Shutdown(shutCtx)
+		}
+		done <- struct{}{}
+	}()
+	<-done
+	<-done
 	return nil
 }
 

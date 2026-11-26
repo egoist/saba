@@ -259,6 +259,14 @@ func (e *Engine) prepare(st *store.State, name string, req *api.DeployRequest) (
 	if a.Kind == api.KindDatabase && cfg.EffectiveReplicas() > 1 {
 		return nil, nil, nil, api.Errorf(api.CodeInvalid, "databases run a single replica")
 	}
+	nodes, err := placement(st, &cfg)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	if a.Kind == api.KindDatabase && len(nodes) > 1 {
+		return nil, nil, nil, api.Errorf(api.CodeInvalid, "a database runs on a single node").
+			WithHint("Its data lives in a volume on one server. Set nodes to one name.")
+	}
 	// Validate against a candidate record without touching the saved one.
 	candidate := *a
 	candidate.Config, candidate.Env = cfg, env
@@ -282,7 +290,11 @@ func (e *Engine) prepare(st *store.State, name string, req *api.DeployRequest) (
 	if cfg.ReleaseCommand != "" {
 		plan = append(plan, "run release command: "+cfg.ReleaseCommand)
 	}
-	plan = append(plan, fmt.Sprintf("start %d replica(s) with the %s strategy", cfg.EffectiveReplicas(), cfg.EffectiveStrategy()))
+	on := ""
+	if len(nodes) > 1 || !isLocal(nodes[0]) {
+		on = " on " + strings.Join(nodes, ", ")
+	}
+	plan = append(plan, fmt.Sprintf("start %d replica(s)%s with the %s strategy", cfg.EffectiveReplicas(), on, cfg.EffectiveStrategy()))
 	if cfg.EffectiveStrategy() == api.StrategyRolling || cur == nil {
 		plan = append(plan, "wait for health checks, switch traffic, then drain and stop the old version")
 	} else {
@@ -472,7 +484,7 @@ func (e *Engine) runDeploy(ctx context.Context, r *Run, contextDir string) {
 		e.removeContainers(cctx, r.App, func(c *runtime.Container) bool {
 			return c.Labels[LabelVersion] == strconv.Itoa(r.Version)
 		}, time.Second)
-		_ = e.RT.RemoveImage(cctx, imageTag(r.App, r.Version))
+		e.removeImage(cctx, imageTag(r.App, r.Version))
 		_ = e.Store.UpdateApp(r.App, func(a *store.AppRecord) error {
 			if d := a.Deployment(r.Version); d != nil {
 				d.Status = api.StatusFailed
@@ -661,8 +673,8 @@ func (e *Engine) recreate(ctx context.Context, r *Run, server api.ServerConfig, 
 
 	sctx, cancel := bg(ctx, 5*time.Minute)
 	defer cancel()
-	old, _ := e.RT.List(sctx, map[string]string{LabelApp: a.Name, LabelRole: RoleApp})
-	var stopped []string
+	old, _ := e.list(sctx, map[string]string{LabelApp: a.Name, LabelRole: RoleApp})
+	var stopped []runtime.Container
 	if len(old) > 0 {
 		r.phase("stop", "Stopping v%d (requests are held until the new version is ready)", a.CurrentVersion)
 	}
@@ -671,11 +683,11 @@ func (e *Engine) recreate(ctx context.Context, r *Run, server api.ServerConfig, 
 			continue
 		}
 		wasRunning := c.Running()
-		if err := e.RT.Stop(sctx, c.Name, dur(cfg.StopTimeout, defaultStopTimeout)); err != nil {
+		if err := e.rt(c.Node).Stop(sctx, c.Name, dur(cfg.StopTimeout, defaultStopTimeout)); err != nil {
 			e.Log.Warn("stop failed", "container", c.Name, "err", err)
 		}
 		if wasRunning {
-			stopped = append(stopped, c.Name)
+			stopped = append(stopped, c)
 		}
 	}
 
@@ -690,10 +702,10 @@ func (e *Engine) recreate(ctx context.Context, r *Run, server api.ServerConfig, 
 			e.removeContainers(sctx, a.Name, func(c *runtime.Container) bool {
 				return c.Labels[LabelVersion] == strconv.Itoa(dep.Version)
 			}, time.Second)
-			for _, name := range stopped {
-				if serr := e.RT.Start(sctx, name); serr != nil {
-					e.Log.Error("could not restore old container", "container", name, "err", serr)
-					r.logf("deploy", "Could not restart %s: %v", name, serr)
+			for _, c := range stopped {
+				if serr := e.rt(c.Node).Start(sctx, c.Name); serr != nil {
+					e.Log.Error("could not restore old container", "container", c.Name, "err", serr)
+					r.logf("deploy", "Could not restart %s: %v", c.Name, serr)
 				}
 			}
 			// Give the restored version a chance to boot before held requests reach it.
@@ -716,7 +728,7 @@ func (e *Engine) recreate(ctx context.Context, r *Run, server api.ServerConfig, 
 // keepAlive makes healthy replicas restart on crashes and host reboots.
 func (e *Engine) keepAlive(ctx context.Context, replicas []api.Replica) {
 	for _, rep := range replicas {
-		if err := e.RT.SetRestart(ctx, rep.Container, "unless-stopped"); err != nil {
+		if err := e.rt(rep.Node).SetRestart(ctx, rep.Container, "unless-stopped"); err != nil {
 			e.Log.Warn("cannot set restart policy", "container", rep.Container, "err", err)
 		}
 	}
@@ -941,6 +953,9 @@ func (e *Engine) runOptions(a *store.AppRecord, dep *api.Deployment, env map[str
 		Env:     copyMap(env),
 		Network: Network,
 		Aliases: []string{a.Name},
+		// One-off containers (release, cron, run) start on the primary;
+		// replicas override this with their own node's view.
+		ExtraHosts: extraHosts(e.Store.Snapshot(), a.Name, api.LocalNode),
 	}
 	for _, v := range cfg.Volumes {
 		vol, err := api.ParseVolume(v)
@@ -967,45 +982,92 @@ func (e *Engine) startReplicas(ctx context.Context, r *Run, a *store.AppRecord, 
 	if err != nil {
 		return nil, api.Errorf(api.CodeInvalid, "invalid command: %v", err)
 	}
-	used := usedPorts(e.Store.Snapshot())
-	r.phase("start", "Starting %d replica(s) of v%d", n, dep.Version)
+	st := e.Store.Snapshot()
+	nodes, err := placement(st, &cfg)
+	if err != nil {
+		return nil, err
+	}
+	// Replicas are spread round-robin; with fewer replicas than nodes only
+	// the first ones are used.
+	if len(nodes) > n {
+		nodes = nodes[:n]
+	}
+	for _, node := range nodes {
+		if !isLocal(node) {
+			if err := e.ship(ctx, r, dep.Image, node); err != nil {
+				return nil, err
+			}
+		}
+	}
+	used := usedPorts(st)
+	where := ""
+	if len(nodes) > 1 || !isLocal(nodes[0]) {
+		where = " on " + strings.Join(nodes, ", ")
+	}
+	r.phase("start", "Starting %d replica(s) of v%d%s", n, dep.Version, where)
 
 	var replicas []api.Replica
 	fail := func(err error) ([]api.Replica, error) {
 		cctx, cancel := bg(ctx, time.Minute)
 		defer cancel()
 		for _, rep := range replicas {
-			_ = e.RT.Remove(cctx, rep.Container)
+			_ = e.rt(rep.Node).Remove(cctx, rep.Container)
+			if !isLocal(rep.Node) && rep.HostPort > 0 {
+				e.Nodes.Unforward(cctx, rep.Node, rep.HostPort)
+			}
 		}
 		return nil, err
 	}
 	for i := 1; i <= n; i++ {
+		node := nodes[(i-1)%len(nodes)]
 		rep := api.Replica{Index: i, Container: containerName(a.Name, dep.Version, i)}
-		opts := e.runOptions(a, dep, env)
-		opts.Name = rep.Container
-		opts.Labels = labels(a.Name, dep.Version, i, RoleApp)
-		opts.Command = cmd
-		// No restart policy until the replica has proven healthy: a container
-		// that crashes on boot then stays down with its real exit code.
-		opts.Restart = "no"
-		opts.StopTimeout = dur(cfg.StopTimeout, defaultStopTimeout)
-		opts.Env["SABA_REPLICA"] = strconv.Itoa(i)
-		if dep.Port > 0 && a.Kind == api.KindApp {
-			hp, err := e.allocPort(used)
-			if err != nil {
-				return fail(err)
-			}
-			rep.HostPort = hp
-			opts.Ports = append(opts.Ports, fmt.Sprintf("127.0.0.1:%d:%d", hp, dep.Port))
+		if !isLocal(node) {
+			rep.Node = node
 		}
-		opts.Ports = append(opts.Ports, cfg.Publish...)
-		_ = e.RT.Remove(ctx, rep.Container) // leftover from a crashed attempt
-		id, err := e.RT.Run(ctx, opts)
+		rt := e.rt(node)
+		_ = rt.Remove(ctx, rep.Container) // leftover from a crashed attempt
+
+		var id string
+		// A port that is free on the primary may be taken on a remote node;
+		// try a few before giving up.
+		for attempt := 0; ; attempt++ {
+			opts := e.runOptions(a, dep, env)
+			opts.Name = rep.Container
+			opts.Labels = labels(a.Name, dep.Version, i, RoleApp)
+			opts.Command = cmd
+			// No restart policy until the replica has proven healthy: a container
+			// that crashes on boot then stays down with its real exit code.
+			opts.Restart = "no"
+			opts.StopTimeout = dur(cfg.StopTimeout, defaultStopTimeout)
+			opts.Env["SABA_REPLICA"] = strconv.Itoa(i)
+			opts.Env["SABA_NODE"] = node
+			opts.ExtraHosts = extraHosts(st, a.Name, node)
+			if dep.Port > 0 && a.Kind == api.KindApp {
+				hp, perr := e.allocPort(used)
+				if perr != nil {
+					return fail(perr)
+				}
+				rep.HostPort = hp
+				opts.Labels[LabelPort] = strconv.Itoa(hp)
+				opts.Ports = append(opts.Ports, fmt.Sprintf("127.0.0.1:%d:%d", hp, dep.Port))
+			}
+			opts.Ports = append(opts.Ports, cfg.Publish...)
+			id, err = rt.Run(ctx, opts)
+			if err == nil || !portConflict(err) || isLocal(node) || rep.HostPort == 0 || attempt >= 5 {
+				break
+			}
+			_ = rt.Remove(ctx, rep.Container)
+		}
 		if err != nil {
 			if ctx.Err() != nil {
 				return fail(ctx.Err())
 			}
-			return fail(api.Errorf(api.CodeRuntime, "could not start container %s: %v", rep.Container, err).
+			_ = rt.Remove(ctx, rep.Container)
+			target := rep.Container
+			if !isLocal(node) {
+				target += " on node " + node
+			}
+			return fail(api.Errorf(api.CodeRuntime, "could not start container %s: %v", target, err).
 				WithHint("Check `command`, `volumes`, `publish` and `resources` in the app config."))
 		}
 		if len(id) > 12 {
@@ -1013,6 +1075,12 @@ func (e *Engine) startReplicas(ctx context.Context, r *Run, a *store.AppRecord, 
 		}
 		rep.ContainerID = id
 		replicas = append(replicas, rep)
+		if !isLocal(node) && rep.HostPort > 0 {
+			if err := e.Nodes.Forward(ctx, node, rep.HostPort); err != nil {
+				return fail(api.Errorf(api.CodeRuntime, "cannot open a tunnel to node %q: %v", node, err).
+					WithHint("Check the node with `saba node list`."))
+			}
+		}
 	}
 	// Persist immediately so port reservations and crash recovery see them.
 	_ = e.Store.UpdateApp(a.Name, func(a *store.AppRecord) error {
@@ -1026,7 +1094,7 @@ func (e *Engine) startReplicas(ctx context.Context, r *Run, a *store.AppRecord, 
 
 // removeContainers stops and removes the app's containers selected by match.
 func (e *Engine) removeContainers(ctx context.Context, app string, match func(*runtime.Container) bool, stopTimeout time.Duration) int {
-	cs, err := e.RT.List(ctx, map[string]string{LabelApp: app})
+	cs, err := e.list(ctx, map[string]string{LabelApp: app})
 	if err != nil {
 		e.Log.Warn("cannot list containers", "app", app, "err", err)
 		return 0
@@ -1042,11 +1110,12 @@ func (e *Engine) removeContainers(ctx context.Context, app string, match func(*r
 		go func() {
 			defer func() { done <- struct{}{} }()
 			if c.Running() {
-				_ = e.RT.Stop(ctx, c.Name, stopTimeout)
+				_ = e.rt(c.Node).Stop(ctx, c.Name, stopTimeout)
 			}
-			if err := e.RT.Remove(ctx, c.Name); err != nil {
-				e.Log.Warn("cannot remove container", "container", c.Name, "err", err)
+			if err := e.rt(c.Node).Remove(ctx, c.Name); err != nil {
+				e.Log.Warn("cannot remove container", "container", c.Name, "node", c.Node, "err", err)
 			}
+			e.unforward(ctx, c)
 		}()
 	}
 	for i := 0; i < n; i++ {
@@ -1103,7 +1172,7 @@ func (e *Engine) pruneVersions(ctx context.Context, app string) {
 	for _, img := range remove {
 		if !seen[img] {
 			seen[img] = true
-			_ = e.RT.RemoveImage(ctx, img)
+			e.removeImage(ctx, img)
 		}
 	}
 	e.mu.Lock()

@@ -105,7 +105,7 @@ func (e *Engine) waitHealthy(ctx context.Context, r *Run, a *store.AppRecord, de
 		// Capture the evidence before the failed containers are removed.
 		lctx, lcancel := bg(ctx, 15*time.Second)
 		var lines []string
-		_ = e.RT.Logs(lctx, out.rep.Container, runtime.LogOptions{Tail: 40}, func(l runtime.LogLine) {
+		_ = e.rt(out.rep.Node).Logs(lctx, out.rep.Container, runtime.LogOptions{Tail: 40}, func(l runtime.LogLine) {
 			lines = append(lines, l.Text)
 		})
 		defer lcancel()
@@ -137,7 +137,7 @@ func (e *Engine) checkReplica(ctx context.Context, spec healthSpec, dep *api.Dep
 	}
 	keepHint := "The previous version keeps serving traffic. Fix the problem and deploy again."
 	for {
-		c, err := e.RT.Inspect(ctx, rep.Container)
+		c, err := e.rt(rep.Node).Inspect(ctx, rep.Container)
 		if ctx.Err() != nil {
 			break
 		}
@@ -191,7 +191,7 @@ func (e *Engine) checkReplica(ctx context.Context, spec healthSpec, dep *api.Dep
 func (e *Engine) probe(ctx context.Context, spec healthSpec, c *runtime.Container, rep api.Replica) (bool, string) {
 	switch spec.mode {
 	case "command":
-		code, err := e.RT.Exec(ctx, rep.Container, spec.command, discard{}, discard{})
+		code, err := e.rt(rep.Node).Exec(ctx, rep.Container, spec.command, nil, discard{}, discard{})
 		if err != nil {
 			return false, "health command failed to run: " + err.Error()
 		}

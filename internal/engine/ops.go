@@ -39,13 +39,13 @@ func (e *Engine) App(ctx context.Context, name string) (*api.App, error) {
 	if a == nil {
 		return nil, store.NotFound(name)
 	}
-	cs, _ := e.RT.List(ctx, map[string]string{LabelApp: name, LabelRole: RoleApp})
+	cs, _ := e.list(ctx, map[string]string{LabelApp: name, LabelRole: RoleApp})
 	return e.view(st, a, cs, true), nil
 }
 
 func (e *Engine) containersByApp(ctx context.Context) map[string][]runtime.Container {
 	out := map[string][]runtime.Container{}
-	cs, err := e.RT.List(ctx, map[string]string{LabelManaged: "true", LabelRole: RoleApp})
+	cs, err := e.list(ctx, map[string]string{LabelManaged: "true", LabelRole: RoleApp})
 	if err != nil {
 		e.Log.Warn("cannot list containers", "err", err)
 		return out
@@ -79,8 +79,12 @@ func (e *Engine) view(st *store.State, a *store.AppRecord, cs []runtime.Containe
 				unstable = true
 			}
 		}
+		node := c.Node
+		if node == "" {
+			node = api.LocalNode
+		}
 		v.Containers = append(v.Containers, api.ContainerStatus{
-			Name: c.Name, Replica: rep, Version: ver, State: c.State, Health: c.Health,
+			Name: c.Name, Node: node, Replica: rep, Version: ver, State: c.State, Health: c.Health,
 			Restarts: c.Restarts, ExitCode: c.ExitCode, OOMKilled: c.OOMKilled,
 			StartedAt: c.StartedAt, HostPort: hostPorts[c.Name],
 		})
@@ -207,21 +211,30 @@ func (e *Engine) current(name string) (*store.State, *store.AppRecord, *api.Depl
 	return st, a, cur, nil
 }
 
-// Container returns the container name of a replica of the live version.
-func (e *Engine) Container(name string, replica int) (string, error) {
+// Replica returns a replica of the live version (the first one by default).
+func (e *Engine) Replica(name string, replica int) (*api.Replica, error) {
 	_, _, cur, err := e.current(name)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 	if replica <= 0 {
 		replica = 1
 	}
-	for _, r := range cur.Replicas {
-		if r.Index == replica {
-			return r.Container, nil
+	for i := range cur.Replicas {
+		if cur.Replicas[i].Index == replica {
+			return &cur.Replicas[i], nil
 		}
 	}
-	return "", api.Errorf(api.CodeNotFound, "%q has no replica %d (it runs %d)", name, replica, len(cur.Replicas))
+	return nil, api.Errorf(api.CodeNotFound, "%q has no replica %d (it runs %d)", name, replica, len(cur.Replicas))
+}
+
+// Container returns the container name of a replica of the live version.
+func (e *Engine) Container(name string, replica int) (string, error) {
+	rep, err := e.Replica(name, replica)
+	if err != nil {
+		return "", err
+	}
+	return rep.Container, nil
 }
 
 // Logs streams runtime logs of the live version.
@@ -256,7 +269,7 @@ func (e *Engine) Logs(ctx context.Context, name string, q api.LogsQuery, fn func
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			err := e.RT.Logs(ctx, rep.Container, opts, func(l runtime.LogLine) {
+			err := e.rt(rep.Node).Logs(ctx, rep.Container, opts, func(l runtime.LogLine) {
 				ev := api.Event{Type: "log", Stream: "container", Replica: rep.Index, Time: l.Time, Message: l.Text}
 				mu.Lock()
 				defer mu.Unlock()
@@ -298,7 +311,7 @@ func (e *Engine) Logs(ctx context.Context, name string, q api.LogsQuery, fn func
 
 // Exec runs a command in a running replica, or in a fresh one-off container
 // created from the live version's image, env and volumes.
-func (e *Engine) Exec(ctx context.Context, name string, req api.ExecRequest, stdout, stderr io.Writer) (int, error) {
+func (e *Engine) Exec(ctx context.Context, name string, req api.ExecRequest, stdin io.Reader, stdout, stderr io.Writer) (int, error) {
 	if len(req.Command) == 0 {
 		return -1, api.Errorf(api.CodeInvalid, "no command given").WithHint("Example: `saba exec -a %s -- ls -la`.", name)
 	}
@@ -307,11 +320,11 @@ func (e *Engine) Exec(ctx context.Context, name string, req api.ExecRequest, std
 		return -1, err
 	}
 	if !req.OneOff {
-		container, err := e.Container(name, req.Replica)
+		rep, err := e.Replica(name, req.Replica)
 		if err != nil {
 			return -1, err
 		}
-		code, err := e.RT.Exec(ctx, container, req.Command, stdout, stderr)
+		code, err := e.rt(rep.Node).Exec(ctx, rep.Container, req.Command, stdin, stdout, stderr)
 		if err != nil {
 			return -1, api.Errorf(api.CodeRuntime, "exec failed: %v", err).
 				WithHint("Check the app is running with `saba status -a %s`. Use `saba run` to start a fresh one-off container instead.", name)
@@ -382,7 +395,7 @@ func (e *Engine) Stop(ctx context.Context, name string) error {
 		old.Close()
 	}
 	for _, r := range cur.Replicas {
-		if err := e.RT.Stop(ctx, r.Container, dur(cur.Config.StopTimeout, defaultStopTimeout)); err != nil {
+		if err := e.rt(r.Node).Stop(ctx, r.Container, dur(cur.Config.StopTimeout, defaultStopTimeout)); err != nil {
 			return api.Errorf(api.CodeRuntime, "cannot stop %s: %v", r.Container, err)
 		}
 	}
@@ -401,7 +414,7 @@ func (e *Engine) Start(ctx context.Context, name string) error {
 		return err
 	}
 	for _, r := range cur.Replicas {
-		if err := e.RT.Start(ctx, r.Container); err != nil {
+		if err := e.rt(r.Node).Start(ctx, r.Container); err != nil {
 			return api.Errorf(api.CodeRuntime, "cannot start %s: %v", r.Container, err).
 				WithHint("Recreate the containers with `saba restart -a %s`.", name)
 		}
@@ -453,7 +466,7 @@ func (e *Engine) Destroy(ctx context.Context, name string, removeVolumes bool) (
 	for _, d := range a.Deployments {
 		if d.Image != "" && !seen[d.Image] && strings.HasPrefix(d.Image, "saba/"+name+":") {
 			seen[d.Image] = true
-			_ = e.RT.RemoveImage(ctx, d.Image)
+			e.removeImage(ctx, d.Image)
 		}
 	}
 	// Volumes may have been created by any version, including failed ones.
@@ -478,6 +491,11 @@ func (e *Engine) Destroy(ctx context.Context, name string, removeVolumes bool) (
 			e.Log.Warn("cannot remove volume", "volume", vn, "err", err)
 			kept = append(kept, vn)
 		}
+		for _, node := range e.remoteNodes() {
+			if err := e.Nodes.Runtime(node).RemoveVolume(ctx, vn); err != nil {
+				e.Log.Warn("cannot remove volume", "volume", vn, "node", node, "err", err)
+			}
+		}
 	}
 	if err := e.Store.Update(func(st *store.State) error {
 		delete(st.Apps, name)
@@ -493,6 +511,10 @@ func (e *Engine) Destroy(ctx context.Context, name string, removeVolumes bool) (
 	}
 	e.mu.Unlock()
 	os.RemoveAll(filepath.Join(e.DataDir, "logs", name))
+	if removeVolumes {
+		// Backups are data too: they go only when the caller asked to delete data.
+		os.RemoveAll(e.backupDir(name))
+	}
 	return kept, nil
 }
 
@@ -583,28 +605,38 @@ func (e *Engine) Stats(ctx context.Context, name string) ([]api.Stats, error) {
 		}
 		filter[LabelApp] = name
 	}
-	cs, err := e.RT.List(ctx, filter)
+	cs, err := e.list(ctx, filter)
 	if err != nil {
 		return nil, api.Errorf(api.CodeRuntime, "cannot list containers: %v", err)
 	}
 	apps := map[string]string{}
-	var names []string
+	byNode := map[string][]string{}
 	for _, c := range cs {
 		if c.Running() {
-			names = append(names, c.Name)
+			byNode[c.Node] = append(byNode[c.Node], c.Name)
 			apps[c.Name] = c.Labels[LabelApp]
 		}
 	}
-	raw, err := e.RT.Stats(ctx, names)
-	if err != nil {
-		return nil, api.Errorf(api.CodeRuntime, "cannot read stats: %v", err)
-	}
-	out := make([]api.Stats, 0, len(raw))
-	for _, s := range raw {
-		out = append(out, api.Stats{
-			App: apps[s.Container], Container: s.Container, CPU: s.CPU, Memory: s.Memory,
-			MemoryPct: s.MemoryPct, NetIO: s.NetIO, BlockIO: s.BlockIO, PIDs: s.PIDs,
-		})
+	out := []api.Stats{}
+	for node, names := range byNode {
+		raw, err := e.rt(node).Stats(ctx, names)
+		if err != nil {
+			if isLocal(node) {
+				return nil, api.Errorf(api.CodeRuntime, "cannot read stats: %v", err)
+			}
+			e.Log.Warn("cannot read stats from node", "node", node, "err", err)
+			continue
+		}
+		label := node
+		if label == "" {
+			label = api.LocalNode
+		}
+		for _, s := range raw {
+			out = append(out, api.Stats{
+				App: apps[s.Container], Node: label, Container: s.Container, CPU: s.CPU, Memory: s.Memory,
+				MemoryPct: s.MemoryPct, NetIO: s.NetIO, BlockIO: s.BlockIO, PIDs: s.PIDs,
+			})
+		}
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Container < out[j].Container })
 	return out, nil
@@ -635,7 +667,21 @@ func (e *Engine) Reconcile(ctx context.Context) {
 		return nil
 	})
 	st := e.Store.Snapshot()
-	all, err := e.RT.List(ctx, map[string]string{LabelManaged: "true"})
+	// Tunnels to remote replicas do not survive the daemon; restore them first.
+	if e.Nodes != nil {
+		for _, a := range st.Apps {
+			if cur := a.Current(); cur != nil {
+				for _, r := range cur.Replicas {
+					if !isLocal(r.Node) && r.HostPort > 0 {
+						if err := e.Nodes.Forward(ctx, r.Node, r.HostPort); err != nil {
+							e.Log.Warn("cannot restore tunnel", "node", r.Node, "port", r.HostPort, "err", err)
+						}
+					}
+				}
+			}
+		}
+	}
+	all, err := e.list(ctx, map[string]string{LabelManaged: "true"})
 	if err != nil {
 		e.Log.Error("cannot list containers", "err", err)
 	}
@@ -652,10 +698,11 @@ func (e *Engine) Reconcile(ctx context.Context) {
 		switch {
 		case orphan:
 			e.Log.Info("removing orphaned container", "container", c.Name)
-			_ = e.RT.Remove(ctx, c.Name)
+			_ = e.rt(c.Node).Remove(ctx, c.Name)
+			e.unforward(ctx, &c)
 		case !a.Stopped && !c.Running() && c.State != "restarting":
 			e.Log.Info("starting container", "container", c.Name)
-			if err := e.RT.Start(ctx, c.Name); err != nil {
+			if err := e.rt(c.Node).Start(ctx, c.Name); err != nil {
 				e.Log.Warn("cannot start container", "container", c.Name, "err", err)
 			}
 		}

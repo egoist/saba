@@ -63,6 +63,7 @@ saba deploy [path]            Deploy a directory (default .), or --image <ref>, 
      --port N --domain D... --replicas N -e K=V... --env-file F --command C
      --release-command C --strategy rolling|recreate --health-path /p
      --memory 512m --cpus 0.5 --volume name:/path... --dockerfile F --worker --internal
+     --node local|<name>|"*" ...   servers to spread replicas across
      -m "note" -d/--detach --dry-run -q/--quiet --events
 saba rollback [app] [--to vN] Redeploy a previous version (image + config + env)
 saba deployments [app]        History; ROLLBACK column = restorable
@@ -86,13 +87,19 @@ saba run -- <cmd...>          In a fresh one-off container of the live image (en
 saba cron [list] | run <job>
 saba db create <name> --engine postgres|mysql|mariadb|redis|mongo [--version V]
 saba db list | url <name> | link <name> -a <app> [--as VAR]
+saba db backup create <db> [-o file|dir|-] | list <db> | download <db> [id|latest] [-o ...]
+saba db backup delete <db> <id> --yes | schedule <db> [<cron>|off] [--keep N]
+saba db restore <db> (--backup <id>|latest | <file|->) --yes
 saba destroy <app> --yes [--volumes]
 
 saba context add <name> <user@host> | use <name> | list | remove <name>
 saba server setup <user@host> [--name N] [--email E] [--base-domain D] [--install-docker]
                               [--version vX.Y.Z]   Downloads saba from GitHub releases onto the
                               server (same version as this CLI by default). Re-run to upgrade.
-saba server info | config | config set <key> <value> | prune
+saba server info | config | config set <key> <value|-> | prune
+     keys: base_domain acme_email keep_versions address cloudflare_api_token dns_hook
+saba node [list] | add <name> <user@host> [--address IP] [--no-authorize] | remove <name> --yes | key
+saba certs [list] | add --cert <chain.pem> --key <key.pem> | remove <id> --yes
 saba mcp                      MCP server on stdio (same tools as this CLI)
 saba guide                    This document
 ```
@@ -110,6 +117,7 @@ image = "ghcr.io/me/api:1.4"    # deploy an image; omit to build this directory
 port = 8080                     # container port (also set as $PORT). Default: image EXPOSE
 domains = ["api.example.com"]   # default: <name>.<server base_domain>
 replicas = 2                    # default 1
+nodes = ["local", "worker1"]    # servers to spread replicas across; ["*"] = all. Default: local
 command = "node server.js"      # overrides the image CMD
 release_command = "npm run migrate"   # one-off container, must exit 0 before the rollout
 strategy = "rolling"            # rolling (default) | recreate
@@ -176,7 +184,49 @@ saba db link main -a api              # sets DATABASE_URL=${{main.URL}} on api a
 
 Databases are reachable only from other apps (`main:5432`), keep data in a named volume, and are
 deleted with `saba destroy main --yes --volumes` (after unlinking: `saba env unset -a api DATABASE_URL`).
-Back up with e.g. `saba exec -a main -- pg_dump -U postgres main > backup.sql`.
+
+## Database backups
+
+Supported: postgres, mysql, mariadb, mongo (not redis). Backups are gzip-compressed dumps kept
+on the server; ids are UTC timestamps (`20261126T105124Z-manual`), `latest` is accepted wherever
+an id is.
+
+```
+saba db backup schedule main @daily --keep 14   # cron or @hourly/@daily/@weekly, UTC; "off" disables
+saba db backup create main -o ./                # dump now and download it
+saba db restore main --backup latest --yes      # or a local file, plain or .gz; "-" reads stdin
+```
+
+Scheduled backups are pruned to the newest `--keep` (default 7); manual ones are never pruned.
+A Postgres restore is a single transaction: if it fails nothing changes. `saba destroy <db>
+--volumes` also deletes its backups; without `--volumes` they are kept.
+
+## Multiple servers
+
+The server running the daemon is the primary, node `local`. `saba node add <name> <user@host>`
+adds a worker: it needs Docker and SSH access from the primary, nothing else. The command logs
+in to the node from the machine running the CLI to authorize the primary's key; if only the
+primary can reach the node, authorize the key from `saba node key` by hand and pass
+`--no-authorize`.
+
+- `nodes = ["local", "w1"]` (or `--node`, repeatable) spreads replicas round-robin; `["*"]`
+  uses every server. Containers report their node in `saba status` and get `SABA_NODE`.
+- Images are built on the primary and sent to nodes automatically.
+- An unreachable node shows as `unreachable` in `saba node list` and `saba doctor`; its replicas
+  leave the rotation and the app shows `degraded`. saba reconnects by itself.
+- Apps with `volumes` and databases must use exactly one node.
+- Container names (`http://api:8080`, `main:5432`) resolve only between containers on the same
+  server. An app with `publish` ports is additionally resolvable by name from other nodes, at
+  its server's `address` (set with `saba node add --address` / `saba server config set address`).
+
+## Certificates
+
+Regular domains: nothing to do, a certificate is issued on the first HTTPS request. Wildcards
+need DNS access: `saba server config set cloudflare_api_token -` (token on stdin; needs
+Zone:Read + DNS:Edit) or `saba server config set dns_hook /abs/path` (called as
+`<hook> present|cleanup <record-name> <value>`). saba then keeps a wildcard certificate for the
+base domain and for each `*.domain` routed to an app; `saba certs` shows status and errors.
+`saba certs add --cert --key` installs your own certificate for the names it lists.
 
 ## Recipes
 
@@ -217,6 +267,9 @@ DeployResult { app, deployed, saved, dry_run, deployment, urls[], plan[] }     #
                                                          # scale, rollback, env set, domains add
 exec/run     { exit_code, stdout, stderr }
 doctor       { ok, checks[{name, ok, message, hint}] }
+Node         { name, ssh, address, status: connected|unreachable, error, docker_version, replicas }
+Backup       { id, app, kind: manual|scheduled, engine, size, created_at }
+Certificate  { id, names[], source: custom|dns, issuer, not_after, status: active|expired|pending|failed|skipped, error }
 Event        { type: "phase"|"log"|"result"|"error", time, phase, stream, message, result, error }
 ```
 
@@ -230,5 +283,6 @@ Event        { type: "phase"|"log"|"result"|"error", time, phase, stream, messag
 - Concurrent deploys of the same app are rejected with `deploy_in_progress` (exit 4).
 - A deployment keeps running on the server if the CLI disconnects; follow it with
   `saba logs --deployment latest -f`.
-- Restarting the daemon (e.g. upgrading saba) interrupts the proxy for a moment; app containers
-  keep running.
+- Restarting the daemon (e.g. upgrading saba with `saba server setup`) does not drop traffic:
+  connections wait on systemd-held sockets and in-flight requests finish first. A deployment in
+  progress at that moment is marked failed and must be re-run.

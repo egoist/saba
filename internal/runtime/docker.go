@@ -22,6 +22,8 @@ import (
 // saba compatible with every Docker version and with BuildKit's build UX.
 type Docker struct {
 	Bin string
+	// Host is the engine to talk to (a DOCKER_HOST value). Empty means the local one.
+	Host string
 
 	driverOnce sync.Once
 	logDriver  string
@@ -34,6 +36,9 @@ var _ Runtime = (*Docker)(nil)
 func (d *Docker) cmd(ctx context.Context, args ...string) *exec.Cmd {
 	c := exec.CommandContext(ctx, d.Bin, args...)
 	c.Env = append(os.Environ(), "DOCKER_BUILDKIT=1", "DOCKER_CLI_HINTS=false")
+	if d.Host != "" {
+		c.Env = append(c.Env, "DOCKER_HOST="+d.Host, "DOCKER_CONTEXT=")
+	}
 	c.WaitDelay = 5 * time.Second
 	return c
 }
@@ -164,6 +169,26 @@ func (d *Docker) InspectImage(ctx context.Context, ref string) (*Image, error) {
 	return img, nil
 }
 
+func (d *Docker) SaveImage(ctx context.Context, ref string, w io.Writer) error {
+	c := d.cmd(ctx, "save", ref)
+	var stderr tailBuffer
+	c.Stdout, c.Stderr = w, &stderr
+	if err := c.Run(); err != nil {
+		return wrapErr([]string{"save"}, stderr.String(), err)
+	}
+	return nil
+}
+
+func (d *Docker) LoadImage(ctx context.Context, r io.Reader) error {
+	c := d.cmd(ctx, "load", "--quiet")
+	var out tailBuffer
+	c.Stdin, c.Stdout, c.Stderr = r, &out, &out
+	if err := c.Run(); err != nil {
+		return wrapErr([]string{"load"}, out.String(), err)
+	}
+	return nil
+}
+
 func (d *Docker) TagImage(ctx context.Context, src, dst string) error {
 	_, err := d.output(ctx, "tag", src, dst)
 	return err
@@ -210,6 +235,9 @@ func (d *Docker) runArgs(o RunOptions, c *exec.Cmd) []string {
 	}
 	for _, v := range o.Volumes {
 		args = append(args, "-v", v)
+	}
+	for _, h := range o.ExtraHosts {
+		args = append(args, "--add-host", h)
 	}
 	if o.Memory != "" {
 		args = append(args, "--memory", o.Memory)
@@ -502,10 +530,15 @@ func parseLogLine(line string) LogLine {
 	return LogLine{Text: line}
 }
 
-func (d *Docker) Exec(ctx context.Context, name string, cmd []string, stdout, stderr io.Writer) (int, error) {
-	args := append([]string{"exec", name}, cmd...)
+func (d *Docker) Exec(ctx context.Context, name string, cmd []string, stdin io.Reader, stdout, stderr io.Writer) (int, error) {
+	args := []string{"exec"}
+	if stdin != nil {
+		args = append(args, "-i")
+	}
+	args = append(append(args, name), cmd...)
 	c := d.cmd(ctx, args...)
 	var tail tailBuffer
+	c.Stdin = stdin
 	c.Stdout, c.Stderr = stdout, io.MultiWriter(stderr, &tail)
 	err := c.Run()
 	if err != nil && isNotFound(tail.String()) {

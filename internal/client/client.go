@@ -505,3 +505,117 @@ func (c *Client) Prune(ctx context.Context) (*api.PruneResult, error) {
 	var out api.PruneResult
 	return &out, c.json(ctx, "POST", "/v1/prune", nil, nil, &out)
 }
+
+func (c *Client) Backups(ctx context.Context, name string) ([]api.Backup, error) {
+	var out []api.Backup
+	return out, c.json(ctx, "GET", appPath(name, "/backups"), nil, nil, &out)
+}
+
+func (c *Client) BackupCreate(ctx context.Context, name string) (*api.Backup, error) {
+	var out api.Backup
+	return &out, c.json(ctx, "POST", appPath(name, "/backups"), nil, nil, &out)
+}
+
+// BackupDownload streams a stored backup (gzip) to w and returns its file name.
+func (c *Client) BackupDownload(ctx context.Context, name, id string, w io.Writer) (string, error) {
+	resp, err := c.request(ctx, "GET", appPath(name, "/backups/"+url.PathEscape(id)), nil, nil, "")
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	n, err := io.Copy(w, resp.Body)
+	if err != nil {
+		return "", c.transportError(ctx, err)
+	}
+	if resp.ContentLength > 0 && n != resp.ContentLength {
+		return "", api.Errorf(api.CodeUnreachable, "the download was cut short (%d of %d bytes)", n, resp.ContentLength)
+	}
+	return resp.Header.Get("X-Saba-Backup-File"), nil
+}
+
+func (c *Client) BackupDelete(ctx context.Context, name, id string) error {
+	return c.json(ctx, "DELETE", appPath(name, "/backups/"+url.PathEscape(id)), nil, nil, nil)
+}
+
+func (c *Client) BackupPolicy(ctx context.Context, name string, p api.BackupPolicy) (*api.BackupPolicy, error) {
+	var out api.BackupPolicy
+	return &out, c.json(ctx, "PUT", appPath(name, "/backup-policy"), nil, p, &out)
+}
+
+type RestoreResult struct {
+	App      string      `json:"app"`
+	Restored bool        `json:"restored"`
+	Backup   *api.Backup `json:"backup,omitempty"`
+}
+
+// Restore loads a stored backup (id) or, when dump is non-nil, the given dump.
+func (c *Client) Restore(ctx context.Context, name, id string, dump io.Reader) (*RestoreResult, error) {
+	q := url.Values{}
+	ct := ""
+	if dump == nil {
+		q.Set("backup", id)
+	} else {
+		ct = "application/octet-stream"
+	}
+	resp, err := c.request(ctx, "POST", appPath(name, "/restore"), q, dump, ct)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	var out RestoreResult
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return nil, api.Errorf(api.CodeInternal, "cannot decode server response: %v", err)
+	}
+	return &out, nil
+}
+
+func (c *Client) Nodes(ctx context.Context) ([]api.Node, error) {
+	var out []api.Node
+	return out, c.json(ctx, "GET", "/v1/nodes", nil, nil, &out)
+}
+
+func (c *Client) NodeKey(ctx context.Context) (string, error) {
+	var out struct {
+		PublicKey string `json:"public_key"`
+	}
+	return out.PublicKey, c.json(ctx, "GET", "/v1/nodes/key", nil, nil, &out)
+}
+
+func (c *Client) NodeAdd(ctx context.Context, n api.Node) (*api.Node, error) {
+	var out api.Node
+	return &out, c.json(ctx, "POST", "/v1/nodes", nil, n, &out)
+}
+
+func (c *Client) NodeRemove(ctx context.Context, name string) error {
+	return c.json(ctx, "DELETE", "/v1/nodes/"+url.PathEscape(name), nil, nil, nil)
+}
+
+// ContainerInfo locates a replica's container for interactive use.
+type ContainerInfo struct {
+	Container  string `json:"container"`
+	Node       string `json:"node,omitempty"`
+	DockerHost string `json:"docker_host,omitempty"`
+}
+
+func (c *Client) ContainerInfo(ctx context.Context, name string, replica int) (*ContainerInfo, error) {
+	var out ContainerInfo
+	q := url.Values{}
+	if replica > 0 {
+		q.Set("replica", strconv.Itoa(replica))
+	}
+	return &out, c.json(ctx, "GET", appPath(name, "/container"), q, nil, &out)
+}
+
+func (c *Client) Certs(ctx context.Context) ([]api.Certificate, error) {
+	var out []api.Certificate
+	return out, c.json(ctx, "GET", "/v1/certs", nil, nil, &out)
+}
+
+func (c *Client) CertAdd(ctx context.Context, certPEM, keyPEM string) (*api.Certificate, error) {
+	var out api.Certificate
+	return &out, c.json(ctx, "POST", "/v1/certs", nil, map[string]string{"cert": certPEM, "key": keyPEM}, &out)
+}
+
+func (c *Client) CertRemove(ctx context.Context, id string) error {
+	return c.json(ctx, "DELETE", "/v1/certs/"+url.PathEscape(id), nil, nil, nil)
+}

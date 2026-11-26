@@ -258,7 +258,11 @@ func (c *CLI) serverCmd() *cobra.Command {
 		Long: `Server settings:
   base_domain     apps without custom domains are served at <app>.<base_domain>
   acme_email      contact address for Let's Encrypt (applies after a daemon restart)
-  keep_versions   old versions kept per app for rollbacks (default 5)`,
+  keep_versions   old versions kept per app for rollbacks (default 5)
+  address         this server's address on the network shared with other nodes
+  cloudflare_api_token   enables wildcard certificates (DNS-01) for Cloudflare zones;
+                  pass "-" as the value to read it from stdin
+  dns_hook        executable that manages DNS-01 records for other DNS hosts`,
 		Example: "  saba server config\n  saba server config set base_domain apps.example.com",
 		Args:    maxArgs(0),
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -271,8 +275,9 @@ func (c *CLI) serverCmd() *cobra.Command {
 				return err
 			}
 			return c.result(info.Config, func() {
-				c.ui.printf("base_domain   = %s\nacme_email    = %s\nkeep_versions = %d\n",
-					orDash(info.Config.BaseDomain), orDash(info.Config.ACMEEmail), max(info.Config.KeepVersions, 5))
+				c.ui.printf("base_domain          = %s\nacme_email           = %s\nkeep_versions        = %d\naddress              = %s\ncloudflare_api_token = %s\ndns_hook             = %s\n",
+					orDash(info.Config.BaseDomain), orDash(info.Config.ACMEEmail), max(info.Config.KeepVersions, 5),
+					orDash(info.Config.Address), orDash(info.Config.CloudflareAPIToken), orDash(info.Config.DNSHook))
 			})
 		},
 	}
@@ -284,6 +289,14 @@ func (c *CLI) serverCmd() *cobra.Command {
 				return err
 			}
 			var value any = args[1]
+			if args[1] == "-" {
+				// Secrets can be piped in instead of ending up in shell history.
+				b, err := io.ReadAll(io.LimitReader(os.Stdin, 64*1024))
+				if err != nil {
+					return err
+				}
+				value = strings.TrimSpace(string(b))
+			}
 			if args[0] == "keep_versions" {
 				n, err := strconv.Atoi(args[1])
 				if err != nil {
@@ -296,7 +309,13 @@ func (c *CLI) serverCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			return c.result(cfg, func() { c.ui.success("%s = %s", key, args[1]) })
+			return c.result(cfg, func() {
+				shown := args[1]
+				if key == "cloudflare_api_token" {
+					shown = orDash(cfg.CloudflareAPIToken)
+				}
+				c.ui.success("%s = %s", key, shown)
+			})
 		},
 	})
 
@@ -576,7 +595,7 @@ func (p prefixWriter) Write(b []byte) (int, error) {
 // ---- daemon ----------------------------------------------------------------
 
 type daemonFlags struct {
-	dataDir, socket, http, https, tls, email, baseDomain, acmeDir string
+	dataDir, socket, http, https, tls, email, baseDomain, acmeDir, acmeCA string
 }
 
 func (f *daemonFlags) register(cmd *cobra.Command) {
@@ -589,6 +608,7 @@ func (f *daemonFlags) register(cmd *cobra.Command) {
 	fl.StringVar(&f.email, "acme-email", "", "Contact email for Let's Encrypt (stored on first start)")
 	fl.StringVar(&f.baseDomain, "base-domain", "", "Base domain for app URLs; \"auto\" derives <public-ip>.sslip.io (stored on first start)")
 	fl.StringVar(&f.acmeDir, "acme-directory", "", "Alternative ACME directory URL (e.g. Let's Encrypt staging)")
+	fl.StringVar(&f.acmeCA, "acme-ca-file", "", "Extra root certificate to trust for the ACME directory (private or test CAs)")
 }
 
 func (f *daemonFlags) args() []string {
@@ -602,10 +622,69 @@ func (f *daemonFlags) args() []string {
 	if f.acmeDir != "" {
 		args = append(args, "--acme-directory", f.acmeDir)
 	}
+	if f.acmeCA != "" {
+		args = append(args, "--acme-ca-file", f.acmeCA)
+	}
 	return args
 }
 
-const unitPath = "/etc/systemd/system/saba.service"
+const (
+	unitDir     = "/etc/systemd/system"
+	serviceUnit = "saba.service"
+	socketUnit  = "saba.socket"
+)
+
+// listenStream converts a Go listen address to systemd's ListenStream syntax.
+func listenStream(addr string) string {
+	if strings.HasPrefix(addr, ":") {
+		return addr[1:] // all interfaces, IPv4 and IPv6
+	}
+	return addr
+}
+
+// systemdUnits renders the socket and service units.
+//
+// The HTTP(S) sockets are owned by systemd and passed to the daemon (socket
+// activation). They stay open while the daemon restarts, so an upgrade makes
+// clients wait for a moment instead of refusing their connections.
+func systemdUnits(exe string, f *daemonFlags) (socket, service string) {
+	streams := "ListenStream=" + listenStream(f.http) + "\n"
+	if f.tls != "off" {
+		streams += "ListenStream=" + listenStream(f.https) + "\n"
+	}
+	socket = `[Unit]
+Description=saba — HTTP and HTTPS sockets
+Documentation=https://github.com/egoist/saba
+
+[Socket]
+` + streams + `Backlog=4096
+NoDelay=true
+
+[Install]
+WantedBy=sockets.target
+`
+	service = fmt.Sprintf(`[Unit]
+Description=saba — app platform daemon
+Documentation=https://github.com/egoist/saba
+Requires=%s
+After=network-online.target docker.service %s
+Wants=network-online.target docker.service
+
+[Service]
+ExecStart=%s
+Restart=always
+RestartSec=1
+# In-flight requests get up to 30s to finish when the daemon stops.
+TimeoutStopSec=45
+LimitNOFILE=1048576
+# Containers are managed by Docker and must survive daemon restarts.
+KillMode=process
+
+[Install]
+WantedBy=multi-user.target
+`, socketUnit, socketUnit, shellwords.Join(append([]string{exe}, f.args()...)))
+	return socket, service
+}
 
 func (c *CLI) daemonCmd() *cobra.Command {
 	var f daemonFlags
@@ -628,7 +707,7 @@ For local experiments, run it unprivileged:
 			err := daemon.Run(cmd.Context(), daemon.Options{
 				Version: Version, DataDir: f.dataDir, Socket: f.socket,
 				HTTPAddr: f.http, HTTPSAddr: f.https, TLS: f.tls,
-				ACMEEmail: f.email, BaseDomain: f.baseDomain, ACMEDirectory: f.acmeDir, Log: log,
+				ACMEEmail: f.email, BaseDomain: f.baseDomain, ACMEDirectory: f.acmeDir, ACMECAFile: f.acmeCA, Log: log,
 			})
 			if err != nil {
 				return api.Errorf(api.CodeRuntime, "%v", err)
@@ -655,43 +734,58 @@ For local experiments, run it unprivileged:
 			if !printUnit && os.Geteuid() != 0 {
 				return api.Errorf(api.CodeInvalid, "installing the service requires root").WithHint("Run it with sudo.")
 			}
-			unit := fmt.Sprintf(`[Unit]
-Description=saba — app platform daemon
-Documentation=https://github.com/egoist/saba
-After=network-online.target docker.service
-Wants=network-online.target docker.service
-
-[Service]
-ExecStart=%s
-Restart=always
-RestartSec=2
-LimitNOFILE=1048576
-# Containers are managed by Docker and must survive daemon restarts.
-KillMode=process
-
-[Install]
-WantedBy=multi-user.target
-`, shellwords.Join(append([]string{exe}, inst.args()...)))
+			socket, service := systemdUnits(exe, &inst)
 			if printUnit {
-				fmt.Fprint(c.stdout, unit)
+				fmt.Fprintf(c.stdout, "# %s/%s\n%s\n# %s/%s\n%s", unitDir, socketUnit, socket, unitDir, serviceUnit, service)
 				return nil
 			}
-			if err := os.WriteFile(unitPath, []byte(unit), 0o644); err != nil {
+			systemctl := func(args ...string) error {
+				out, err := exec.CommandContext(cmd.Context(), "systemctl", args...).CombinedOutput()
+				if err != nil {
+					return api.Errorf(api.CodeRuntime, "systemctl %s failed: %s", strings.Join(args, " "), strings.TrimSpace(string(out))).
+						WithHint("Inspect the service with `journalctl -u saba -n 50`. Ports 80 and 443 must be free.")
+				}
+				return nil
+			}
+			socketPath := filepath.Join(unitDir, socketUnit)
+			previous, _ := os.ReadFile(socketPath)
+			if err := os.WriteFile(socketPath, []byte(socket), 0o644); err != nil {
 				return err
 			}
-			for _, a := range [][]string{{"daemon-reload"}, {"enable", "saba.service"}, {"restart", "saba.service"}} {
-				if out, err := exec.CommandContext(cmd.Context(), "systemctl", a...).CombinedOutput(); err != nil {
-					return api.Errorf(api.CodeRuntime, "systemctl %s failed: %s", strings.Join(a, " "), strings.TrimSpace(string(out))).
-						WithHint("Inspect the service with `journalctl -u saba -n 50`.")
+			if err := os.WriteFile(filepath.Join(unitDir, serviceUnit), []byte(service), 0o644); err != nil {
+				return err
+			}
+			if err := systemctl("daemon-reload"); err != nil {
+				return err
+			}
+			if err := systemctl("enable", socketUnit, serviceUnit); err != nil {
+				return err
+			}
+			// When systemd already holds the sockets, restarting only the service
+			// is seamless: connections queue on the sockets meanwhile. Otherwise
+			// (first install, upgrade from a version without socket activation,
+			// changed addresses) the sockets have to be (re)created once.
+			seamless := string(previous) == socket && exec.CommandContext(cmd.Context(), "systemctl", "is-active", "--quiet", socketUnit).Run() == nil
+			if seamless {
+				if err := systemctl("restart", serviceUnit); err != nil {
+					return err
+				}
+			} else {
+				_ = exec.CommandContext(cmd.Context(), "systemctl", "stop", serviceUnit).Run()
+				if err := systemctl("restart", socketUnit); err != nil {
+					return err
+				}
+				if err := systemctl("start", serviceUnit); err != nil {
+					return err
 				}
 			}
-			return c.result(map[string]any{"installed": true, "unit": unitPath}, func() {
-				c.ui.success("saba service installed and started (%s)", unitPath)
+			return c.result(map[string]any{"installed": true, "units": []string{socketPath, filepath.Join(unitDir, serviceUnit)}, "seamless_restart": seamless}, func() {
+				c.ui.success("saba service installed and started (%s, %s)", socketUnit, serviceUnit)
 			})
 		},
 	}
 	inst.register(install)
-	install.Flags().BoolVar(&printUnit, "print-unit", false, "Print the systemd unit instead of installing it")
+	install.Flags().BoolVar(&printUnit, "print-unit", false, "Print the systemd units instead of installing them")
 
 	uninstall := &cobra.Command{
 		Use:   "uninstall",
@@ -701,8 +795,9 @@ WantedBy=multi-user.target
 			if os.Geteuid() != 0 {
 				return api.Errorf(api.CodeInvalid, "removing the service requires root").WithHint("Run it with sudo.")
 			}
-			_ = exec.CommandContext(cmd.Context(), "systemctl", "disable", "--now", "saba.service").Run()
-			os.Remove(unitPath)
+			_ = exec.CommandContext(cmd.Context(), "systemctl", "disable", "--now", socketUnit, serviceUnit).Run()
+			os.Remove(filepath.Join(unitDir, socketUnit))
+			os.Remove(filepath.Join(unitDir, serviceUnit))
 			_ = exec.CommandContext(cmd.Context(), "systemctl", "daemon-reload").Run()
 			return c.result(map[string]any{"uninstalled": true}, func() {
 				c.ui.success("saba service removed")

@@ -17,7 +17,6 @@ import (
 	"time"
 
 	"github.com/egoist/saba/internal/api"
-	"github.com/egoist/saba/internal/engine"
 	"github.com/egoist/saba/internal/store"
 )
 
@@ -37,6 +36,15 @@ func (d *Daemon) routes() http.Handler {
 	h("GET /v1/stats", d.handleStats)
 	h("POST /v1/prune", d.handlePrune)
 
+	h("GET /v1/certs", d.handleCerts)
+	h("POST /v1/certs", d.handleCertAdd)
+	h("DELETE /v1/certs/{id}", d.handleCertRemove)
+
+	h("GET /v1/nodes", d.handleNodes)
+	h("POST /v1/nodes", d.handleNodeAdd)
+	h("GET /v1/nodes/key", d.handleNodeKey)
+	h("DELETE /v1/nodes/{node}", d.handleNodeRemove)
+
 	h("GET /v1/apps", d.handleApps)
 	h("GET /v1/apps/{app}", d.handleApp)
 	h("DELETE /v1/apps/{app}", d.handleDestroy)
@@ -52,6 +60,12 @@ func (d *Daemon) routes() http.Handler {
 	h("GET /v1/apps/{app}/container", d.handleContainer)
 	h("POST /v1/apps/{app}/exec", d.handleExec)
 	h("POST /v1/apps/{app}/cron/{job}/run", d.handleCronRun)
+	h("GET /v1/apps/{app}/backups", d.handleBackups)
+	h("POST /v1/apps/{app}/backups", d.handleBackupCreate)
+	h("GET /v1/apps/{app}/backups/{id}", d.handleBackupDownload)
+	h("DELETE /v1/apps/{app}/backups/{id}", d.handleBackupDelete)
+	h("PUT /v1/apps/{app}/backup-policy", d.handleBackupPolicy)
+	h("POST /v1/apps/{app}/restore", d.handleRestore)
 
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		writeError(w, api.Errorf(api.CodeNotFound, "unknown API endpoint %s %s", r.Method, r.URL.Path).
@@ -126,7 +140,7 @@ func (d *Daemon) handleInfo(w http.ResponseWriter, r *http.Request) error {
 		TLS:        d.opts.TLS,
 		HTTPAddr:   d.opts.HTTPAddr,
 		DataDir:    d.opts.DataDir,
-		Config:     st.Server,
+		Config:     redact(st.Server),
 		Apps:       len(st.Apps),
 		Uptime:     time.Since(d.started).Round(time.Second).String(),
 	}
@@ -138,7 +152,7 @@ func (d *Daemon) handleInfo(w http.ResponseWriter, r *http.Request) error {
 }
 
 func (d *Daemon) handleGetConfig(w http.ResponseWriter, r *http.Request) error {
-	writeJSON(w, http.StatusOK, d.store.Snapshot().Server)
+	writeJSON(w, http.StatusOK, redact(d.store.Snapshot().Server))
 	return nil
 }
 
@@ -158,6 +172,21 @@ func (d *Daemon) handlePatchConfig(w http.ResponseWriter, r *http.Request) error
 			case "acme_email":
 				s, _ := v.(string)
 				st.Server.ACMEEmail = strings.TrimSpace(s)
+			case "cloudflare_api_token":
+				s, _ := v.(string)
+				st.Server.CloudflareAPIToken = strings.TrimSpace(s)
+			case "dns_hook":
+				s, _ := v.(string)
+				s = strings.TrimSpace(s)
+				if s != "" {
+					if info, err := os.Stat(s); err != nil || info.IsDir() || !filepath.IsAbs(s) || info.Mode()&0o111 == 0 {
+						return api.Errorf(api.CodeInvalid, "dns_hook must be the absolute path of an executable on the server")
+					}
+				}
+				st.Server.DNSHook = s
+			case "address":
+				s, _ := v.(string)
+				st.Server.Address = strings.TrimSpace(s)
 			case "keep_versions":
 				n, ok := v.(float64)
 				if !ok || n < 1 || n > 100 {
@@ -166,7 +195,7 @@ func (d *Daemon) handlePatchConfig(w http.ResponseWriter, r *http.Request) error
 				st.Server.KeepVersions = int(n)
 			default:
 				return api.Errorf(api.CodeInvalid, "unknown server config key %q", k).
-					WithHint("Valid keys: base_domain, acme_email, keep_versions.")
+					WithHint("Valid keys: base_domain, acme_email, keep_versions, address, cloudflare_api_token, dns_hook.")
 			}
 		}
 		out = st.Server
@@ -176,7 +205,10 @@ func (d *Daemon) handlePatchConfig(w http.ResponseWriter, r *http.Request) error
 		return err
 	}
 	d.engine.RefreshRoutes()
-	writeJSON(w, http.StatusOK, out)
+	// New DNS settings deserve an immediate attempt.
+	d.issuer.Forget()
+	go d.ensureCerts(context.WithoutCancel(r.Context()))
+	writeJSON(w, http.StatusOK, redact(out))
 	return nil
 }
 
@@ -402,11 +434,17 @@ func (d *Daemon) handleLogs(w http.ResponseWriter, r *http.Request) error {
 
 func (d *Daemon) handleContainer(w http.ResponseWriter, r *http.Request) error {
 	replica, _ := strconv.Atoi(r.URL.Query().Get("replica"))
-	name, err := d.engine.Container(r.PathValue("app"), replica)
+	rep, err := d.engine.Replica(r.PathValue("app"), replica)
 	if err != nil {
 		return err
 	}
-	writeJSON(w, http.StatusOK, map[string]string{"container": name})
+	out := map[string]string{"container": rep.Container}
+	if rep.Node != "" {
+		// How to reach the node's Docker engine from the primary.
+		out["node"] = rep.Node
+		out["docker_host"] = d.cluster.DockerHost(rep.Node)
+	}
+	writeJSON(w, http.StatusOK, out)
 	return nil
 }
 
@@ -440,7 +478,7 @@ func (d *Daemon) handleExec(w http.ResponseWriter, r *http.Request) error {
 		return err
 	}
 	s := newStream(w)
-	code, err := d.engine.Exec(r.Context(), name, req, eventWriter{s, "stdout"}, eventWriter{s, "stderr"})
+	code, err := d.engine.Exec(r.Context(), name, req, nil, eventWriter{s, "stdout"}, eventWriter{s, "stderr"})
 	if err != nil {
 		if errors.Is(r.Context().Err(), context.Canceled) {
 			return nil
@@ -484,4 +522,83 @@ func (d *Daemon) handlePrune(w http.ResponseWriter, r *http.Request) error {
 	return nil
 }
 
-var _ = engine.Network
+func (d *Daemon) handleBackups(w http.ResponseWriter, r *http.Request) error {
+	backups, err := d.engine.Backups(r.PathValue("app"))
+	if err != nil {
+		return err
+	}
+	writeJSON(w, http.StatusOK, backups)
+	return nil
+}
+
+func (d *Daemon) handleBackupCreate(w http.ResponseWriter, r *http.Request) error {
+	// A dump runs to completion even if the client goes away.
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), 6*time.Hour)
+	defer cancel()
+	b, err := d.engine.Backup(ctx, r.PathValue("app"), "manual")
+	if err != nil {
+		return err
+	}
+	writeJSON(w, http.StatusOK, b)
+	return nil
+}
+
+func (d *Daemon) handleBackupDownload(w http.ResponseWriter, r *http.Request) error {
+	f, b, err := d.engine.OpenBackup(r.PathValue("app"), r.PathValue("id"))
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	w.Header().Set("Content-Type", "application/gzip")
+	w.Header().Set("Content-Length", strconv.FormatInt(b.Size, 10))
+	w.Header().Set("X-Saba-Backup-Id", b.ID)
+	w.Header().Set("X-Saba-Backup-File", filepath.Base(f.Name()))
+	_, _ = io.Copy(w, f)
+	return nil
+}
+
+func (d *Daemon) handleBackupDelete(w http.ResponseWriter, r *http.Request) error {
+	if err := d.engine.DeleteBackup(r.PathValue("app"), r.PathValue("id")); err != nil {
+		return err
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"app": r.PathValue("app"), "deleted": r.PathValue("id")})
+	return nil
+}
+
+func (d *Daemon) handleBackupPolicy(w http.ResponseWriter, r *http.Request) error {
+	var p api.BackupPolicy
+	if err := readJSON(r, &p); err != nil {
+		return err
+	}
+	out, err := d.engine.SetBackupPolicy(r.PathValue("app"), p)
+	if err != nil {
+		return err
+	}
+	if out == nil {
+		out = &api.BackupPolicy{}
+	}
+	writeJSON(w, http.StatusOK, out)
+	return nil
+}
+
+// handleRestore restores a stored backup (?backup=<id>) or the dump sent as
+// the request body.
+func (d *Daemon) handleRestore(w http.ResponseWriter, r *http.Request) error {
+	name := r.PathValue("app")
+	// Abandoning a restore halfway would be worse than finishing it.
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), 6*time.Hour)
+	defer cancel()
+	if id := r.URL.Query().Get("backup"); id != "" {
+		b, err := d.engine.RestoreBackup(ctx, name, id)
+		if err != nil {
+			return err
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"app": name, "restored": true, "backup": b})
+		return nil
+	}
+	if err := d.engine.Restore(ctx, name, r.Body); err != nil {
+		return err
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"app": name, "restored": true})
+	return nil
+}

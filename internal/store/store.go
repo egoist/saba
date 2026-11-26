@@ -52,6 +52,8 @@ type State struct {
 	SchemaVersion int                   `json:"schema_version"`
 	Server        api.ServerConfig      `json:"server"`
 	Apps          map[string]*AppRecord `json:"apps"`
+	// Nodes are the additional servers of the cluster, by name.
+	Nodes map[string]*api.Node `json:"nodes,omitempty"`
 }
 
 func (s *State) clone() (*State, error) {

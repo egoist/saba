@@ -58,6 +58,32 @@ func (d *Daemon) handleDoctor(w http.ResponseWriter, r *http.Request) error {
 		}
 	}
 
+	status := d.cluster.Status()
+	for _, name := range sortedKeys(st.Nodes) {
+		if ns := status[name]; ns.Up {
+			add("node:"+name, true, "Connected (Docker "+ns.Docker+")", "")
+		} else {
+			add("node:"+name, false, "Unreachable: "+ns.Error,
+				fmt.Sprintf("Its replicas are out of rotation until it is back. Check the server and that `ssh %s` works from the primary; saba reconnects on its own.", st.Nodes[name].SSH))
+		}
+	}
+	for name, msg := range d.issuer.Failures() {
+		add("cert:"+name, false, "Wildcard certificate could not be issued: "+msg,
+			"Check the DNS settings with `saba server config`; saba retries hourly, or immediately after a config change.")
+	}
+	for _, c := range d.certs.List() {
+		left := time.Until(c.NotAfter)
+		switch {
+		case c.Source != "custom":
+		case left <= 0:
+			add("cert:"+c.ID, false, "Custom certificate has expired and is no longer used",
+				"Upload a renewed one with `saba certs add`, or remove it with `saba certs remove "+c.ID+" --yes`.")
+		case left < 14*24*time.Hour:
+			add("cert:"+c.ID, false, fmt.Sprintf("Custom certificate expires in %d days", int(left.Hours()/24)),
+				"Upload a renewed one with `saba certs add --cert ... --key ...`.")
+		}
+	}
+
 	local := localIPs()
 	apps, _ := d.engine.Apps(ctx)
 	for _, a := range apps {

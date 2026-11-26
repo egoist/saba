@@ -207,6 +207,10 @@ func (c *CLI) printStatus(a *api.App, t client.Target) {
 	if len(a.Containers) > 0 {
 		ui.printf("\n")
 		rows := make([][]string, 0, len(a.Containers))
+		multiNode := false
+		for _, ct := range a.Containers {
+			multiNode = multiNode || (ct.Node != "" && ct.Node != api.LocalNode)
+		}
 		for _, ct := range a.Containers {
 			state := ui.status(ct.State)
 			if ct.OOMKilled {
@@ -214,12 +218,20 @@ func (c *CLI) printStatus(a *api.App, t client.Target) {
 			} else if ct.State == "exited" {
 				state += ui.dim(fmt.Sprintf(" (%d)", ct.ExitCode))
 			}
-			rows = append(rows, []string{
+			row := []string{
 				strconv.Itoa(ct.Replica), "v" + strconv.Itoa(ct.Version), ct.Name, state,
 				strconv.Itoa(ct.Restarts), ago(ct.StartedAt),
-			})
+			}
+			if multiNode {
+				row = append([]string{row[0], ct.Node}, row[1:]...)
+			}
+			rows = append(rows, row)
 		}
-		ui.table([]string{"REPLICA", "VERSION", "CONTAINER", "STATE", "RESTARTS", "STARTED"}, rows)
+		header := []string{"REPLICA", "VERSION", "CONTAINER", "STATE", "RESTARTS", "STARTED"}
+		if multiNode {
+			header = append([]string{"REPLICA", "NODE"}, header[1:]...)
+		}
+		ui.table(header, rows)
 	}
 
 	if cur != nil && len(cur.Config.Cron) > 0 {
@@ -446,9 +458,9 @@ func (c *CLI) statsCmd() *cobra.Command {
 				}
 				rows := make([][]string, 0, len(stats))
 				for _, s := range stats {
-					rows = append(rows, []string{s.App, s.Container, s.CPU, s.Memory, s.MemoryPct, s.NetIO, s.PIDs})
+					rows = append(rows, []string{s.App, s.Node, s.Container, s.CPU, s.Memory, s.MemoryPct, s.NetIO, s.PIDs})
 				}
-				c.ui.table([]string{"APP", "CONTAINER", "CPU", "MEMORY", "MEM %", "NET I/O", "PIDS"}, rows)
+				c.ui.table([]string{"APP", "NODE", "CONTAINER", "CPU", "MEMORY", "MEM %", "NET I/O", "PIDS"}, rows)
 			})
 		},
 	}
@@ -747,11 +759,16 @@ func (c *CLI) interactive(cmd *cobra.Command, name string, replica int, args []s
 	if err != nil {
 		return err
 	}
-	container, err := cl.Container(cmd.Context(), name, replica)
+	info, err := cl.ContainerInfo(cmd.Context(), name, replica)
 	if err != nil {
 		return err
 	}
-	dockerArgs := append([]string{"docker", "exec", "-it", container}, args...)
+	dockerArgs := []string{"docker"}
+	if info.DockerHost != "" {
+		// The replica runs on another node; the primary reaches its engine here.
+		dockerArgs = append(dockerArgs, "-H", info.DockerHost)
+	}
+	dockerArgs = append(append(dockerArgs, "exec", "-it", info.Container), args...)
 	var argv []string
 	if cl.Target.Local() {
 		argv = dockerArgs

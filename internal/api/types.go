@@ -53,6 +53,9 @@ type AppConfig struct {
 	Internal bool `json:"internal,omitempty"`
 	// Worker apps do not serve HTTP: no port detection, routing or HTTP health check.
 	Worker bool `json:"worker,omitempty"`
+	// Nodes lists the servers replicas are spread across, e.g. ["local",
+	// "worker1"], or ["*"] for all of them. Default: the primary ("local").
+	Nodes []string `json:"nodes,omitempty"`
 	// Replicas is the number of containers to run (default 1).
 	Replicas int `json:"replicas,omitempty"`
 	// Command overrides the image's default command.
@@ -132,6 +135,27 @@ type DatabaseInfo struct {
 	Version string `json:"version"`
 	// EnvName is the conventional variable used when linking (DATABASE_URL, REDIS_URL...).
 	EnvName string `json:"env_name"`
+	// Backup is the automatic backup policy, if one is set.
+	Backup *BackupPolicy `json:"backup,omitempty"`
+}
+
+// BackupPolicy schedules automatic backups of a database.
+type BackupPolicy struct {
+	// Schedule is a cron expression (UTC). Empty disables automatic backups.
+	Schedule string `json:"schedule"`
+	// Keep is how many scheduled backups are retained (default 7).
+	Keep int `json:"keep"`
+}
+
+// Backup is a stored database dump.
+type Backup struct {
+	ID  string `json:"id"`
+	App string `json:"app"`
+	// Kind is "manual" or "scheduled". Only scheduled backups are pruned.
+	Kind      string    `json:"kind"`
+	Engine    string    `json:"engine"`
+	Size      int64     `json:"size"`
+	CreatedAt time.Time `json:"created_at"`
 }
 
 type CronState struct {
@@ -165,6 +189,8 @@ type Source struct {
 }
 
 type Replica struct {
+	// Node is the server the replica runs on; empty means the primary.
+	Node        string `json:"node,omitempty"`
 	Index       int    `json:"index"`
 	Container   string `json:"container"`
 	ContainerID string `json:"container_id,omitempty"`
@@ -197,6 +223,7 @@ func (d *Deployment) Terminal() bool {
 
 type ContainerStatus struct {
 	Name      string    `json:"name"`
+	Node      string    `json:"node"`
 	Replica   int       `json:"replica"`
 	Version   int       `json:"version"`
 	State     string    `json:"state"`
@@ -294,6 +321,54 @@ type ServerConfig struct {
 	ACMEEmail string `json:"acme_email,omitempty"`
 	// KeepVersions is how many old images are kept per app for rollbacks (default 5).
 	KeepVersions int `json:"keep_versions,omitempty"`
+	// Address is the primary's address on the network shared with other
+	// nodes. Containers elsewhere use it to reach apps that publish ports here.
+	Address string `json:"address,omitempty"`
+	// CloudflareAPIToken enables wildcard certificates through the DNS-01
+	// challenge for zones hosted at Cloudflare. It is never returned in full.
+	CloudflareAPIToken string `json:"cloudflare_api_token,omitempty"`
+	// DNSHook is an executable that creates and removes DNS-01 challenge
+	// records, for other DNS hosts.
+	DNSHook string `json:"dns_hook,omitempty"`
+}
+
+// Certificate is a stored (custom or DNS-issued) TLS certificate, or a
+// wildcard certificate saba is trying to obtain.
+type Certificate struct {
+	ID string `json:"id,omitempty"`
+	// Names are the DNS names the certificate covers.
+	Names []string `json:"names"`
+	// Source is "custom" (uploaded) or "dns" (issued through DNS-01).
+	Source    string    `json:"source"`
+	Issuer    string    `json:"issuer,omitempty"`
+	NotBefore time.Time `json:"not_before,omitempty"`
+	NotAfter  time.Time `json:"not_after,omitempty"`
+	// Status is active, expired, pending or failed.
+	Status string `json:"status"`
+	Error  string `json:"error,omitempty"`
+}
+
+// LocalNode is the name of the server the daemon itself runs on.
+const LocalNode = "local"
+
+// Node is an additional server that runs replicas. The primary drives its
+// Docker engine through a persistent SSH connection.
+type Node struct {
+	Name string `json:"name"`
+	// SSH is the destination as reachable from the primary: user@host or ssh://user@host:port.
+	SSH string `json:"ssh,omitempty"`
+	// Address is the node's address on the network shared with the other
+	// nodes (optional); see ServerConfig.Address.
+	Address string `json:"address,omitempty"`
+	// HostKeys pins the node's SSH host keys (known_hosts key fields).
+	HostKeys  []string  `json:"host_keys,omitempty"`
+	CreatedAt time.Time `json:"created_at"`
+
+	// Derived on read.
+	Status   string `json:"status,omitempty"` // connected | unreachable
+	Error    string `json:"error,omitempty"`
+	Docker   string `json:"docker_version,omitempty"`
+	Replicas int    `json:"replicas"`
 }
 
 type ServerInfo struct {
@@ -324,6 +399,7 @@ type DoctorReport struct {
 
 type Stats struct {
 	App       string `json:"app"`
+	Node      string `json:"node"`
 	Container string `json:"container"`
 	CPU       string `json:"cpu"`
 	Memory    string `json:"memory"`

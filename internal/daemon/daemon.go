@@ -19,6 +19,8 @@ import (
 	"time"
 
 	"github.com/egoist/saba/internal/api"
+	"github.com/egoist/saba/internal/certs"
+	"github.com/egoist/saba/internal/cluster"
 	"github.com/egoist/saba/internal/cron"
 	"github.com/egoist/saba/internal/engine"
 	"github.com/egoist/saba/internal/proxy"
@@ -44,7 +46,10 @@ type Options struct {
 	ACMEEmail     string
 	BaseDomain    string
 	ACMEDirectory string
-	Log           *slog.Logger
+	// ACMECAFile is an extra root certificate to trust for the ACME directory
+	// (private or test CAs).
+	ACMECAFile string
+	Log        *slog.Logger
 	// Runtime overrides the container runtime (tests).
 	Runtime runtime.Runtime
 	// Ready, if set, is closed once the daemon is serving.
@@ -58,6 +63,9 @@ type Daemon struct {
 	rt      runtime.Runtime
 	proxy   *proxy.Proxy
 	engine  *engine.Engine
+	cluster *cluster.Manager
+	certs   *certs.Store
+	issuer  *certs.Issuer
 	started time.Time
 
 	cronMu      sync.Mutex
@@ -110,19 +118,48 @@ func Run(ctx context.Context, opts Options) error {
 	d.engine = engine.New(st, rt, d.proxy, opts.DataDir, log)
 	d.engine.TLS = opts.TLS == proxy.TLSAuto
 	d.engine.URLSuffix = urlSuffix(opts)
+	if d.cluster, err = cluster.New(filepath.Join(opts.DataDir, "cluster"), filepath.Join(filepath.Dir(opts.Socket), "nodes"), log); err != nil {
+		return err
+	}
+	d.engine.Nodes = d.cluster
+
+	acmeClient, err := acmeHTTPClient(opts.ACMECAFile)
+	if err != nil {
+		return err
+	}
+	if err := d.setupCerts(acmeClient); err != nil {
+		return err
+	}
+
+	inherited := inheritedListeners()
+	httpL := takeListener(&inherited, opts.HTTPAddr)
+	var httpsL net.Listener
+	if opts.TLS == proxy.TLSAuto {
+		httpsL = takeListener(&inherited, opts.HTTPSAddr)
+	}
+	for _, l := range inherited {
+		log.Warn("ignoring a socket passed by systemd that matches no configured address", "addr", l.Addr().String())
+		l.Close()
+	}
+	socketActivated := httpL != nil || httpsL != nil
 
 	srv, err := d.proxy.Listen(proxy.ServerOptions{
+		HTTPListener:  httpL,
+		HTTPSListener: httpsL,
 		HTTPAddr:      opts.HTTPAddr,
 		HTTPSAddr:     opts.HTTPSAddr,
 		TLS:           opts.TLS,
 		CertDir:       filepath.Join(opts.DataDir, "certs"),
 		Email:         st.Snapshot().Server.ACMEEmail,
 		ACMEDirectory: opts.ACMEDirectory,
+		ACMEClient:    acmeClient,
+		Certs:         d.certs.Lookup,
 	})
 	if err != nil {
 		return err
 	}
 
+	d.connectNodes(ctx)
 	d.engine.Reconcile(ctx)
 
 	apiL, err := listenUnix(opts.Socket)
@@ -133,18 +170,27 @@ func Run(ctx context.Context, opts Options) error {
 
 	log.Info("saba daemon started", "version", opts.Version, "docker", dockerVersion,
 		"http", opts.HTTPAddr, "https", opts.HTTPSAddr, "tls", opts.TLS, "socket", opts.Socket,
+		"socket_activated", socketActivated,
 		"base_domain", st.Snapshot().Server.BaseDomain, "apps", len(st.Snapshot().Apps))
 
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	errc := make(chan error, 2)
-	go func() { errc <- srv.Serve(ctx) }()
+	proxyDone := make(chan struct{})
+	go func() {
+		defer close(proxyDone)
+		if err := srv.Serve(ctx); err != nil {
+			errc <- err
+		}
+	}()
 	go func() {
 		if err := apiSrv.Serve(apiL); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			errc <- err
 		}
 	}()
 	go d.cronLoop(ctx)
+	go d.cluster.Watch(ctx)
+	go d.ensureCerts(ctx)
 	if opts.Ready != nil {
 		close(opts.Ready)
 	}
@@ -158,6 +204,12 @@ func Run(ctx context.Context, opts Options) error {
 	defer shutCancel()
 	_ = apiSrv.Shutdown(shutCtx)
 	apiSrv.Close()
+	// The proxy drains in-flight requests before its Serve returns.
+	<-proxyDone
+	// Only now is it safe to drop the tunnels those requests may have used.
+	closeCtx, closeCancel := context.WithTimeout(context.Background(), 15*time.Second)
+	d.cluster.Close(closeCtx)
+	closeCancel()
 	// Let a deployment that is about to finish record its outcome. Anything
 	// still running after that is failed by Reconcile on the next start.
 	if !d.engine.Wait(5 * time.Second) {
@@ -285,6 +337,10 @@ func (d *Daemon) cronLoop(ctx context.Context) {
 		case <-time.After(next.Sub(now)):
 		}
 		tick := next.UTC()
+		go d.ensureCerts(ctx)
+		for _, name := range d.engine.DueBackups(tick) {
+			go d.runBackup(ctx, name)
+		}
 		st := d.store.Snapshot()
 		for _, a := range st.Apps {
 			cur := a.Current()
@@ -299,6 +355,14 @@ func (d *Daemon) cronLoop(ctx context.Context) {
 				go d.runCron(ctx, a.Name, job.Name)
 			}
 		}
+	}
+}
+
+func (d *Daemon) runBackup(ctx context.Context, name string) {
+	bctx, cancel := context.WithTimeout(ctx, 6*time.Hour)
+	defer cancel()
+	if _, err := d.engine.Backup(bctx, name, "scheduled"); err != nil {
+		d.log.Error("scheduled backup failed", "app", name, "err", err)
 	}
 }
 

@@ -20,6 +20,7 @@ type deployFlags struct {
 	image, git, ref     string
 	port, replicas      int
 	domains, env, vols  []string
+	nodes               []string
 	envFile             string
 	command, release    string
 	strategy            string
@@ -76,6 +77,7 @@ They are remembered by the server, so later deploys do not need to repeat them.`
 	fl.IntVar(&f.port, "port", 0, "Port the app listens on (default: the image's EXPOSE)")
 	fl.StringArrayVar(&f.domains, "domain", nil, "Domain to route to the app (repeatable; replaces the list)")
 	fl.IntVar(&f.replicas, "replicas", 0, "Number of containers to run")
+	fl.StringArrayVar(&f.nodes, "node", nil, "Server to run replicas on: \"local\", a node name, or \"*\" for all (repeatable; replaces the list)")
 	fl.StringArrayVarP(&f.env, "env", "e", nil, "Set an environment variable KEY=VALUE (repeatable)")
 	fl.StringVar(&f.envFile, "env-file", "", "Set environment variables from a dotenv file")
 	fl.StringVar(&f.command, "command", "", "Override the image's default command")
@@ -157,6 +159,7 @@ func (c *CLI) deploy(cmd *cobra.Command, dir string, f *deployFlags) error {
 	}
 	set("port", "port", f.port)
 	set("replicas", "replicas", f.replicas)
+	set("node", "nodes", f.nodes)
 	set("domain", "domains", f.domains)
 	set("command", "command", f.command)
 	set("release-command", "release_command", f.release)
