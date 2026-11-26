@@ -57,17 +57,13 @@ $ cd my-app && saba deploy
 
 ## Install
 
-saba needs Go 1.26+ to build. The same binary is the CLI and the server daemon.
-
 ```sh
-go install github.com/egoist/saba/cmd/saba@latest
-# or, from a checkout
-make install
+curl -fsSL https://raw.githubusercontent.com/egoist/saba/main/install.sh | sh
 ```
 
-Prebuilt binaries are produced by the release workflow when a version tag is pushed; once a
-release exists, `curl -fsSL https://raw.githubusercontent.com/egoist/saba/main/install.sh | sh`
-installs the latest one.
+This installs the CLI for macOS or Linux from the latest
+[GitHub release](https://github.com/egoist/saba/releases). With Go installed,
+`go install github.com/egoist/saba/cmd/saba@latest` works too.
 
 ## Quick start
 
@@ -80,17 +76,10 @@ passwordless sudo):
 saba server setup root@203.0.113.10 --install-docker --email you@example.com
 ```
 
-This checks for Docker (installing it if asked), copies the saba binary, installs the daemon as
-a systemd service and saves the server as a context on your machine. Run it again any time to
-upgrade.
-
-When your machine and the server differ in OS or architecture (e.g. a Mac deploying to a Linux
-VPS), build a server binary and pass it along:
-
-```sh
-GOOS=linux GOARCH=amd64 go build -o saba-linux-amd64 ./cmd/saba
-saba server setup root@203.0.113.10 --binary ./saba-linux-amd64
-```
+This checks for Docker (installing it if asked), downloads saba from GitHub releases onto the
+server, installs the daemon as a systemd service and saves the server as a context on your
+machine. The server fetches the build for its own architecture, in the same version as your
+CLI, so it works the same from a Mac or a Linux box. Run it again any time to upgrade.
 
 ### 2. Deploy
 
@@ -180,9 +169,13 @@ An [MCP](https://modelcontextprotocol.io) server exposes the same operations as 
 ## Development
 
 ```sh
-make build      # ./dist/saba
+make build      # ./dist/saba (needs Go 1.26+)
 make test       # unit and integration tests (no Docker needed)
+make release    # cross-compiled binaries in ./dist, as attached to releases
 ```
+
+To put an unreleased build on a server, upload it instead of downloading a release:
+`saba server setup root@host --binary ./dist/saba-linux-amd64`.
 
 Try it locally without root (needs Docker):
 

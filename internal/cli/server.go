@@ -10,7 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"runtime"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -23,7 +23,60 @@ import (
 	"github.com/egoist/saba/internal/shellwords"
 )
 
-const releaseURL = "https://github.com/egoist/saba/releases/latest/download"
+const releasesURL = "https://github.com/egoist/saba/releases"
+
+var releaseTagRe = regexp.MustCompile(`^v\d+\.\d+\.\d+(-(alpha|beta|rc)[.\d]*)?$`)
+
+// releaseTag picks the release a server should run: the requested one, else
+// the CLI's own version when it is a release build (so client and server
+// match), else "" for the latest release.
+func releaseTag(requested, cliVersion string) (string, error) {
+	if requested != "" && requested != "latest" {
+		given := requested
+		if !strings.HasPrefix(requested, "v") {
+			requested = "v" + requested
+		}
+		if !releaseTagRe.MatchString(requested) {
+			return "", api.Errorf(api.CodeInvalid, "invalid version %q", given).
+				WithHint("Use a release tag like v1.2.3, or \"latest\". Releases: %s", releasesURL)
+		}
+		return requested, nil
+	}
+	if requested == "" && releaseTagRe.MatchString(cliVersion) {
+		return cliVersion, nil
+	}
+	return "", nil
+}
+
+// releaseAsset returns the download URL of a file attached to a release.
+func releaseAsset(base, tag, file string) string {
+	if tag == "" {
+		return base + "/latest/download/" + file
+	}
+	return base + "/download/" + tag + "/" + file
+}
+
+// installScript is the shell script run on the server to download a release
+// binary to dest. The binary is verified against the release's checksums and
+// must run before it replaces the current one, so a bad download never takes
+// a working installation down.
+func installScript(dest, url, sumsURL, asset string) string {
+	q := shellwords.Quote
+	return strings.Join([]string{
+		"set -e",
+		`get() { if command -v curl >/dev/null 2>&1; then curl -fsSL "$1"; elif command -v wget >/dev/null 2>&1; then wget -qO- "$1"; else echo "neither curl nor wget is installed" >&2; return 1; fi; }`,
+		"new=" + q(dest+".new"),
+		"get " + q(url) + ` > "$new" || { echo "could not download ` + url + `" >&2; exit 1; }`,
+		"if command -v sha256sum >/dev/null 2>&1 && sums=$(get " + q(sumsURL) + " 2>/dev/null); then",
+		`  want=$(printf '%s\n' "$sums" | awk -v f=` + q(asset) + ` '$2 == f { print $1 }')`,
+		`  got=$(sha256sum "$new" | awk '{ print $1 }')`,
+		`  if [ -n "$want" ] && [ "$want" != "$got" ]; then echo "checksum mismatch for ` + asset + `" >&2; exit 1; fi`,
+		"fi",
+		`chmod 755 "$new"`,
+		`"$new" --version >/dev/null || { echo "the downloaded file is not a working saba binary" >&2; exit 1; }`,
+		`mv -f "$new" ` + q(dest),
+	}, "\n")
+}
 
 // ---- contexts --------------------------------------------------------------
 
@@ -272,8 +325,8 @@ func (c *CLI) serverCmd() *cobra.Command {
 }
 
 type setupFlags struct {
-	name, email, baseDomain, binary, tls string
-	installDocker, noContext             bool
+	name, email, baseDomain, binary, tls, version string
+	installDocker, noContext                      bool
 }
 
 func (c *CLI) setupCmd() *cobra.Command {
@@ -284,9 +337,13 @@ func (c *CLI) setupCmd() *cobra.Command {
 		Long: `Prepare a fresh Linux server:
 
   1. check for Docker (install it with --install-docker)
-  2. copy the saba binary to /usr/local/bin/saba
+  2. download saba from GitHub releases to /usr/local/bin/saba
   3. install and start the saba daemon as a systemd service
   4. save the server as a context on this machine
+
+The server downloads the build for its own architecture, so it does not matter
+what machine you run this from. By default it installs the same version as this
+CLI (the latest release for development builds); choose another with --version.
 
 Requirements: SSH access as root or a user with passwordless sudo, and ports
 80 and 443 free. Running it again upgrades saba in place; apps keep running.`,
@@ -301,7 +358,8 @@ Requirements: SSH access as root or a user with passwordless sudo, and ports
 	fl.StringVar(&f.email, "email", "", "Contact email for Let's Encrypt certificates")
 	fl.StringVar(&f.baseDomain, "base-domain", "auto", "Base domain for app URLs (\"auto\" = <public-ip>.sslip.io)")
 	fl.StringVar(&f.tls, "tls", "auto", "\"auto\" for Let's Encrypt HTTPS, \"off\" for plain HTTP")
-	fl.StringVar(&f.binary, "binary", "", "Path to a saba binary built for the server (default: this binary, or the latest release)")
+	fl.StringVar(&f.version, "version", "", "Release to install, e.g. v1.2.3 or \"latest\" (default: this CLI's version)")
+	fl.StringVar(&f.binary, "binary", "", "Upload this local Linux binary instead of downloading a release (for unreleased builds)")
 	fl.BoolVar(&f.installDocker, "install-docker", false, "Install Docker with the official script if it is missing")
 	fl.BoolVar(&f.noContext, "no-context", false, "Do not save the server as a context")
 	return cmd
@@ -335,6 +393,17 @@ func (c *CLI) setup(ctx context.Context, target string, f *setupFlags) error {
 			return out.String(), fmt.Errorf("%s", lastLine(orDash(msg)))
 		}
 		return out.String(), nil
+	}
+
+	// Validate input before touching the network.
+	tag, err := releaseTag(f.version, Version)
+	if err != nil {
+		return err
+	}
+	if f.binary != "" {
+		if _, err := os.Stat(f.binary); err != nil {
+			return api.Errorf(api.CodeInvalid, "cannot read binary %s: %v", f.binary, err)
+		}
 	}
 
 	step("Connecting to %s", target)
@@ -380,28 +449,34 @@ func (c *CLI) setup(ctx context.Context, target string, f *setupFlags) error {
 		}
 	}
 
-	// Choose where the server's binary comes from.
-	binary := f.binary
-	if binary == "" && runtime.GOOS == "linux" && runtime.GOARCH == arch {
-		binary, _ = os.Executable()
-	}
-	install := sudo + `sh -c 'cat > /usr/local/bin/saba.new && chmod 755 /usr/local/bin/saba.new && mv -f /usr/local/bin/saba.new /usr/local/bin/saba'`
-	if binary != "" {
-		file, err := os.Open(binary)
+	// The server downloads its own binary from GitHub releases. --binary
+	// uploads a local build instead, for versions that were never released.
+	const dest = "/usr/local/bin/saba"
+	if f.binary != "" {
+		file, err := os.Open(f.binary)
 		if err != nil {
-			return api.Errorf(api.CodeInvalid, "cannot read binary %s: %v", binary, err)
+			return api.Errorf(api.CodeInvalid, "cannot read binary %s: %v", f.binary, err)
 		}
 		defer file.Close()
-		step("Uploading saba (linux/%s)", arch)
-		if _, err := ssh(install, file, false); err != nil {
-			return api.Errorf(api.CodeRuntime, "uploading the binary failed: %v", err)
+		step("Uploading %s (linux/%s)", f.binary, arch)
+		upload := sudo + `sh -c 'cat > ` + dest + `.new && chmod 755 ` + dest + `.new && ` + dest + `.new --version >/dev/null && mv -f ` + dest + `.new ` + dest + `'`
+		if _, err := ssh(upload, file, false); err != nil {
+			return api.Errorf(api.CodeRuntime, "installing the uploaded binary failed: %v", err).
+				WithHint("The binary must be built for the server: linux/%s.", arch)
 		}
 	} else {
-		url := fmt.Sprintf("%s/saba-linux-%s", releaseURL, arch)
-		step("Downloading saba for linux/%s on the server", arch)
-		if _, err := ssh("curl -fsSL "+shellwords.Quote(url)+" | "+install, nil, false); err != nil {
-			return api.Errorf(api.CodeRuntime, "downloading %s failed: %v", url, err).
-				WithHint("Build a binary for the server (`GOOS=linux GOARCH=%s go build -o saba-linux-%s ./cmd/saba`) and pass it with --binary.", arch, arch)
+		asset := "saba-linux-" + arch
+		url := releaseAsset(releasesURL, tag, asset)
+		label := tag
+		if label == "" {
+			label = "latest release"
+		}
+		step("Downloading saba %s (linux/%s) from GitHub", label, arch)
+		script := installScript(dest, url, releaseAsset(releasesURL, tag, "checksums.txt"), asset)
+		if _, err := ssh(sudo+"sh -c "+shellwords.Quote(script), nil, false); err != nil {
+			return api.Errorf(api.CodeRuntime, "installing saba on the server failed: %v", err).
+				WithDetail("url", url).
+				WithHint("Check that the release exists (%s) and that the server can reach github.com. Pick a release with --version <tag>.", releasesURL)
 		}
 	}
 

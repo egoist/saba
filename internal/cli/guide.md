@@ -90,6 +90,8 @@ saba destroy <app> --yes [--volumes]
 
 saba context add <name> <user@host> | use <name> | list | remove <name>
 saba server setup <user@host> [--name N] [--email E] [--base-domain D] [--install-docker]
+                              [--version vX.Y.Z]   Downloads saba from GitHub releases onto the
+                              server (same version as this CLI by default). Re-run to upgrade.
 saba server info | config | config set <key> <value> | prune
 saba mcp                      MCP server on stdio (same tools as this CLI)
 saba guide                    This document
