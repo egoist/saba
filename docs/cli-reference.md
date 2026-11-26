@@ -19,6 +19,10 @@ These work with every command.
 
 ## Commands
 
+- [`saba agent`](#saba-agent) — Run on worker nodes: connect this machine to a saba primary
+  - [`saba agent install`](#saba-agent-install) — Join a cluster and install the agent as a systemd service (as root)
+  - [`saba agent run`](#saba-agent-run) — Run the agent in the foreground (what the service runs)
+  - [`saba agent uninstall`](#saba-agent-uninstall) — Stop the agent and remove it (containers and data on the node are kept)
 - [`saba apps`](#saba-apps) — List apps on the server
 - [`saba cancel`](#saba-cancel) — Stop a deployment in progress
 - [`saba certs`](#saba-certs) — Wildcard and custom TLS certificates
@@ -74,7 +78,6 @@ These work with every command.
 - [`saba mcp`](#saba-mcp) — Run a Model Context Protocol server on stdio
 - [`saba node`](#saba-node) — Add servers to scale apps across machines
   - [`saba node add`](#saba-node-add) — Add a server to the cluster
-  - [`saba node key`](#saba-node-key) — Print the primary's public key (to authorize on nodes by hand)
   - [`saba node list`](#saba-node-list) — List the cluster's servers
   - [`saba node remove`](#saba-node-remove) — Remove a server from the cluster
 - [`saba restart`](#saba-restart) — Restart an app with zero downtime (applies pending config)
@@ -92,6 +95,61 @@ These work with every command.
 - [`saba status`](#saba-status) — Show the state of an app (or of all apps)
 - [`saba stop`](#saba-stop) — Stop an app's containers (keeps config, data and versions)
 - [`saba version`](#saba-version) — Print the CLI version (and the server's, if reachable)
+
+## saba agent
+
+Run on worker nodes: connect this machine to a saba primary
+
+```text
+The agent runs on every node except the primary. It connects out to the
+primary over TLS and carries Docker control and replica traffic over that one
+connection, so the node needs no open ports.
+
+"saba node add" installs it for you over SSH. To install it by hand, run the
+two commands "saba node add <name>" prints, on the node.
+```
+
+Subcommands: [`install`](#saba-agent-install), [`run`](#saba-agent-run), [`uninstall`](#saba-agent-uninstall)
+
+## saba agent install
+
+Join a cluster and install the agent as a systemd service (as root)
+
+```sh
+saba agent install --join <code> [flags]
+```
+
+**Flags**
+
+| Flag | Default | Description |
+|---|---|---|
+| `--join string` |  | Join code from `saba node add` |
+| `--print-unit` |  | Print the systemd unit instead of installing it |
+
+## saba agent run
+
+Run the agent in the foreground (what the service runs)
+
+```sh
+saba agent run [flags]
+```
+
+**Flags**
+
+| Flag | Default | Description |
+|---|---|---|
+| `--config string` | `/etc/saba/agent.json` | Agent configuration file |
+| `--data-dir string` | `/var/lib/saba-agent` | Directory for the agent's key |
+| `--docker-socket string` | `/var/run/docker.sock` | Docker socket to expose to the primary |
+| `--join string` |  | Join code; writes the configuration before running |
+
+## saba agent uninstall
+
+Stop the agent and remove it (containers and data on the node are kept)
+
+```sh
+saba agent uninstall
+```
 
 ## saba apps
 
@@ -347,6 +405,7 @@ For local experiments, run it unprivileged:
 | `--acme-directory string` |  | Alternative ACME directory URL (e.g. Let's Encrypt staging) |
 | `--acme-email string` |  | Contact email for Let's Encrypt (stored on first start) |
 | `--base-domain string` |  | Base domain for app URLs; "auto" derives &lt;public-ip&gt;.sslip.io (stored on first start) |
+| `--cluster-addr string` | `:7443` | Where nodes connect when --tls is off (with TLS they use the HTTPS port) |
 | `--data-dir string` | `/var/lib/saba` | Directory for state, certificates and logs |
 | `--http string` | `:80` | HTTP listen address |
 | `--https string` | `:443` | HTTPS listen address |
@@ -371,6 +430,7 @@ saba daemon install [flags]
 | `--acme-directory string` |  | Alternative ACME directory URL (e.g. Let's Encrypt staging) |
 | `--acme-email string` |  | Contact email for Let's Encrypt (stored on first start) |
 | `--base-domain string` |  | Base domain for app URLs; "auto" derives &lt;public-ip&gt;.sslip.io (stored on first start) |
+| `--cluster-addr string` | `:7443` | Where nodes connect when --tls is off (with TLS they use the HTTPS port) |
 | `--data-dir string` | `/var/lib/saba` | Directory for state, certificates and logs |
 | `--http string` | `:80` | HTTP listen address |
 | `--https string` | `:443` | HTTPS listen address |
@@ -1173,11 +1233,11 @@ saba node
 ```text
 Spread an app's replicas across several servers.
 
-The server running the saba daemon is the primary (node "local"). Additional
-nodes need only Docker and SSH access from the primary: no saba install and no
-open ports. The primary drives each node's Docker engine and reaches its
-replicas through one persistent SSH connection, so traffic between servers is
-encrypted. The primary keeps terminating HTTPS and load-balances all replicas.
+The server running the saba daemon is the primary (node "local"). Every other
+node runs the saba agent, which connects out to the primary over TLS. That one
+encrypted connection carries everything: Docker control and the traffic to the
+node's replicas. Nodes need Docker and no open ports, so they can sit behind
+NAT; the primary only needs its HTTPS port reachable from them.
 
 Place an app with "nodes" in saba.toml or --node on deploy:
 
@@ -1196,65 +1256,58 @@ Aliases: `nodes`
 **Examples**
 
 ```sh
-saba node add worker1 root@10.0.0.2
+saba node add worker1 root@203.0.113.20     # install the agent over SSH
+saba node add homelab                       # print a join command to run on the node
 saba node list
 saba deploy -a web --node local --node worker1 --replicas 4
 saba node remove worker1 --yes
 ```
 
-Subcommands: [`add`](#saba-node-add), [`key`](#saba-node-key), [`list`](#saba-node-list), [`remove`](#saba-node-remove)
+Subcommands: [`add`](#saba-node-add), [`list`](#saba-node-list), [`remove`](#saba-node-remove)
 
 ## saba node add
 
 Add a server to the cluster
 
 ```sh
-saba node add <name> <user@host> [flags]
+saba node add <name> [user@host] [flags]
 ```
 
 ```text
-Register a server as a node. Two things happen:
+Add a server as a node. With an SSH destination, saba installs everything:
+it connects to the server, checks Docker (installing it with
+--install-docker), installs the saba binary and the agent service, and waits
+for the agent to connect.
 
-  1. From this machine, saba logs in to the node over SSH, authorizes the
-     primary's public key there and reads the node's host keys (so the primary
-     can verify it is talking to the same machine).
-  2. The primary connects to the node and checks its Docker engine.
+Without a destination, saba prints a join command to run on the server
+yourself. Use that for machines you cannot reach over SSH from here, such as a
+home server behind NAT. The join code works once and expires after 24 hours.
 
-<user@host> must be reachable from the primary. If this machine cannot reach
-the node (e.g. it only has a private address), use --no-authorize and add the
-key printed by "saba node key" to the node's ~/.ssh/authorized_keys yourself.
+The agent connects to the primary at --primary-address, by default the
+primary's "address" setting or its public IP, on its HTTPS port (443).
 
-Traffic to the node's replicas goes through the SSH connection by default:
-encrypted, and nothing to configure. When the servers share a private network,
---direct --address <private-ip> makes the primary connect to replicas straight
-over that network instead, which is faster. Replica ports are then open on
-that address, unencrypted, so only use it on a network you trust. Run the
-command again to change a node's settings; apps pick them up on their next
-deploy or restart.
+Running it again for a joined node updates its --address. --rejoin issues a new
+join code for a reinstalled machine.
 ```
 
 **Examples**
 
 ```sh
 saba node add worker1 root@203.0.113.20
-saba node add worker1 root@10.0.0.2 --address 10.0.0.2 --direct
+saba node add worker1 deploy@10.0.0.2 --address 10.0.0.2 --primary-address 10.0.0.1
+saba node add homelab
+saba node add worker1 root@203.0.113.20 --rejoin
 ```
 
 **Flags**
 
 | Flag | Default | Description |
 |---|---|---|
-| `--address string` |  | The node's address on the network shared with the other servers (for cross-node access to published ports) |
-| `--direct` |  | Send replica traffic straight to --address over a private network instead of through the SSH tunnel (faster, unencrypted) |
-| `--no-authorize` |  | Do not log in to the node from this machine; the primary's key is already authorized there |
-
-## saba node key
-
-Print the primary's public key (to authorize on nodes by hand)
-
-```sh
-saba node key
-```
+| `--address string` |  | The node's IP on the network shared with the other servers (for cross-node access to published ports) |
+| `--binary string` |  | Upload this local Linux binary instead of downloading a release (for unreleased builds) |
+| `--install-docker` |  | Install Docker on the node if it is missing |
+| `--primary-address string` |  | Address the node uses to reach the primary (default: the primary's address setting, or its public IP) |
+| `--rejoin` |  | Issue a new join code and forget the node's previous key |
 
 ## saba node list
 
@@ -1274,12 +1327,19 @@ Remove a server from the cluster
 saba node remove <name> [flags]
 ```
 
+```text
+Remove a node. It refuses while apps are placed on the node. When the agent
+was installed over SSH, it is uninstalled the same way unless --keep-agent is
+given. Containers, images and volumes on the node are not touched.
+```
+
 Aliases: `rm`
 
 **Flags**
 
 | Flag | Default | Description |
 |---|---|---|
+| `--keep-agent` |  | Do not uninstall the agent from the node |
 | `-y, --yes` |  | Confirm the removal |
 
 ## saba restart

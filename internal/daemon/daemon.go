@@ -4,6 +4,7 @@ package daemon
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"io"
@@ -49,7 +50,10 @@ type Options struct {
 	// ACMECAFile is an extra root certificate to trust for the ACME directory
 	// (private or test CAs).
 	ACMECAFile string
-	Log        *slog.Logger
+	// ClusterAddr is where agents connect when TLS is off. With TLS on they
+	// use the HTTPS port.
+	ClusterAddr string
+	Log         *slog.Logger
 	// Runtime overrides the container runtime (tests).
 	Runtime runtime.Runtime
 	// Ready, if set, is closed once the daemon is serving.
@@ -118,8 +122,22 @@ func Run(ctx context.Context, opts Options) error {
 	d.engine = engine.New(st, rt, d.proxy, opts.DataDir, log)
 	d.engine.TLS = opts.TLS == proxy.TLSAuto
 	d.engine.URLSuffix = urlSuffix(opts)
-	if d.cluster, err = cluster.New(filepath.Join(opts.DataDir, "cluster"), filepath.Join(filepath.Dir(opts.Socket), "nodes"), log); err != nil {
+	d.proxy.Dial = d.engine.Dial
+	clusterID, err := cluster.LoadIdentity(filepath.Join(opts.DataDir, "cluster"), "primary")
+	if err != nil {
+		return fmt.Errorf("cannot load the cluster key: %w", err)
+	}
+	if d.cluster, err = cluster.NewManager(clusterID, filepath.Join(filepath.Dir(opts.Socket), "nodes"), opts.Version, log); err != nil {
 		return err
+	}
+	d.cluster.Authorize = d.authorizeAgent
+	d.cluster.OnConnect = func(node string) {
+		rctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+		defer cancel()
+		d.engine.ReconcileNode(rctx, node)
+	}
+	for name := range st.Snapshot().Nodes {
+		d.cluster.Prepare(name)
 	}
 	d.engine.Nodes = d.cluster
 	remote := &remoteStore{}
@@ -156,12 +174,32 @@ func Run(ctx context.Context, opts Options) error {
 		ACMEDirectory: opts.ACMEDirectory,
 		ACMEClient:    acmeClient,
 		Certs:         d.certs.Lookup,
+		ClusterALPN:   cluster.ALPN,
+		ClusterTLS:    d.cluster.TLSConfig(),
+		Cluster:       d.cluster.Accept,
+		OnDrained:     d.cluster.Close,
 	})
 	if err != nil {
 		return err
 	}
 
-	d.connectNodes(ctx)
+	if opts.TLS != proxy.TLSAuto {
+		// Without an HTTPS listener, agents get a port of their own.
+		if l, err := tls.Listen("tcp", opts.ClusterAddr, d.cluster.TLSConfig()); err != nil {
+			log.Error("cannot listen for nodes; nodes will not be able to connect", "addr", opts.ClusterAddr, "err", err)
+		} else {
+			defer l.Close()
+			go func() {
+				for {
+					c, err := l.Accept()
+					if err != nil {
+						return
+					}
+					go d.cluster.Accept(c.(*tls.Conn))
+				}
+			}()
+		}
+	}
 	d.engine.Reconcile(ctx)
 
 	apiL, err := listenUnix(opts.Socket)
@@ -191,7 +229,6 @@ func Run(ctx context.Context, opts Options) error {
 		}
 	}()
 	go d.cronLoop(ctx)
-	go d.cluster.Watch(ctx)
 	go d.ensureCerts(ctx)
 	if opts.Ready != nil {
 		close(opts.Ready)
@@ -208,10 +245,8 @@ func Run(ctx context.Context, opts Options) error {
 	apiSrv.Close()
 	// The proxy drains in-flight requests before its Serve returns.
 	<-proxyDone
-	// Only now is it safe to drop the tunnels those requests may have used.
-	closeCtx, closeCancel := context.WithTimeout(context.Background(), 15*time.Second)
-	d.cluster.Close(closeCtx)
-	closeCancel()
+	// Only now is it safe to drop the node connections those requests used.
+	d.cluster.Close()
 	// Let a deployment that is about to finish record its outcome. Anything
 	// still running after that is failed by Reconcile on the next start.
 	if !d.engine.Wait(5 * time.Second) {

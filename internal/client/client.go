@@ -578,16 +578,10 @@ func (c *Client) Nodes(ctx context.Context) ([]api.Node, error) {
 	return out, c.json(ctx, "GET", "/v1/nodes", nil, nil, &out)
 }
 
-func (c *Client) NodeKey(ctx context.Context) (string, error) {
-	var out struct {
-		PublicKey string `json:"public_key"`
-	}
-	return out.PublicKey, c.json(ctx, "GET", "/v1/nodes/key", nil, nil, &out)
-}
-
-func (c *Client) NodeAdd(ctx context.Context, n api.Node) (*api.Node, error) {
-	var out api.Node
-	return &out, c.json(ctx, "POST", "/v1/nodes", nil, n, &out)
+// NodeAdd registers a node and returns its join code when it has to join.
+func (c *Client) NodeAdd(ctx context.Context, req api.NodeAddRequest) (*api.NodeAddResponse, error) {
+	var out api.NodeAddResponse
+	return &out, c.json(ctx, "POST", "/v1/nodes", nil, req, &out)
 }
 
 func (c *Client) NodeRemove(ctx context.Context, name string) error {

@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"io"
 	"log/slog"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -22,7 +23,7 @@ import (
 
 // startDaemon runs a real daemon (API, engine, proxy) over a fake container
 // runtime and points the CLI at it.
-func startDaemon(t *testing.T) {
+func startDaemon(t *testing.T) (clusterAddr string) {
 	t.Helper()
 	// Unix socket paths are length-limited, so keep the directory short.
 	dir, err := os.MkdirTemp("", "saba")
@@ -30,13 +31,19 @@ func startDaemon(t *testing.T) {
 		t.Fatal(err)
 	}
 	sock := filepath.Join(dir, "s.sock")
+	l, err := net.Listen("tcp", "127.0.0.1:0") // pick a free port for agents
+	if err != nil {
+		t.Fatal(err)
+	}
+	clusterAddr = l.Addr().String()
+	l.Close()
 	ctx, cancel := context.WithCancel(context.Background())
 	ready := make(chan struct{})
 	done := make(chan error, 1)
 	go func() {
 		done <- daemon.Run(ctx, daemon.Options{
 			Version: "test", DataDir: filepath.Join(dir, "data"), Socket: sock,
-			HTTPAddr: "127.0.0.1:0", TLS: "off", BaseDomain: "apps.test",
+			HTTPAddr: "127.0.0.1:0", TLS: "off", BaseDomain: "apps.test", ClusterAddr: clusterAddr,
 			Runtime: runtimetest.New(), Ready: ready,
 			Log: slog.New(slog.NewTextHandler(io.Discard, nil)),
 		})
@@ -58,6 +65,7 @@ func startDaemon(t *testing.T) {
 	t.Setenv("SABA_APP", "")
 	t.Setenv("SABA_JSON", "")
 	t.Chdir(t.TempDir())
+	return clusterAddr
 }
 
 // saba runs the CLI and returns exit code, stdout and stderr.

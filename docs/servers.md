@@ -176,6 +176,7 @@ Environment=SABA_DEBUG=1
 | `--acme-email` | — | Seeds `acme_email` on the first start |
 | `--acme-directory` | Let's Encrypt | Another ACME CA, e.g. the Let's Encrypt staging environment |
 | `--acme-ca-file` | — | Extra root certificate to trust for a private ACME CA |
+| `--cluster-addr` | `:7443` | Where node agents connect when `--tls off`; with TLS they use the HTTPS port |
 
 ### Running a daemon locally
 
@@ -193,14 +194,23 @@ SABA_HOST=unix://$PWD/.saba/saba.sock saba status
 | `/usr/local/bin/saba` | The binary |
 | `/etc/systemd/system/saba.socket`, `saba.service` | The service |
 | `/run/saba/saba.sock` | Control socket |
-| `/run/saba/nodes/` | SSH control sockets and forwarded Docker sockets for [nodes](scaling.md) |
+| `/run/saba/nodes/` | One socket per [node](scaling.md), reaching its Docker engine through its agent |
 | `/var/lib/saba/state.json` | All state: apps, configuration, **environment variables including secrets**, deployment history, nodes, settings. Root only |
 | `/var/lib/saba/logs/<app>/v<N>.ndjson` | Deployment logs |
 | `/var/lib/saba/backups/<database>/` | Database backups |
 | `/var/lib/saba/certs/` | Issued certificates and ACME account keys |
 | `/var/lib/saba/certs/store/` | Wildcard and uploaded certificates |
-| `/var/lib/saba/cluster/` | The key the primary uses to reach nodes, and their pinned host keys |
+| `/var/lib/saba/cluster/` | The primary's cluster key, which agents pin |
 | `/var/lib/saba/tmp/` | Uploads and builds in progress; emptied on start |
+
+On a node, the agent keeps:
+
+| Path | Contents |
+|---|---|
+| `/usr/local/bin/saba` | The binary (the same one as on the primary) |
+| `/etc/systemd/system/saba-agent.service` | The service |
+| `/etc/saba/agent.json` | The node's name, the primary's address and key fingerprint |
+| `/var/lib/saba-agent/` | The agent's own key |
 
 In Docker:
 

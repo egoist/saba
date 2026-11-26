@@ -41,9 +41,12 @@ type Pool struct {
 	transport *http.Transport
 }
 
-func newPool(version int, addrs []string) *Pool {
+func newPool(version int, addrs []string, dial func(ctx context.Context, network, addr string) (net.Conn, error)) *Pool {
+	if dial == nil {
+		dial = (&net.Dialer{Timeout: 5 * time.Second, KeepAlive: 30 * time.Second}).DialContext
+	}
 	p := &Pool{Version: version, transport: &http.Transport{
-		DialContext:           (&net.Dialer{Timeout: 5 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
+		DialContext:           dial,
 		MaxIdleConns:          256,
 		MaxIdleConnsPerHost:   64,
 		IdleConnTimeout:       90 * time.Second,
@@ -105,6 +108,10 @@ type Proxy struct {
 	httpsPort string // ":8443" when HTTPS is not on 443
 	// PauseTimeout bounds how long a request is held while an app is paused.
 	PauseTimeout time.Duration
+	// Dial, if set, connects to upstream addresses (replicas on other nodes
+	// are reached through their agent). Failures must be *net.OpError dial
+	// errors for failover to work.
+	Dial func(ctx context.Context, network, addr string) (net.Conn, error)
 }
 
 type ctxKey struct{}
@@ -137,7 +144,7 @@ func New(log *slog.Logger) *Proxy {
 // SetApp atomically replaces an app's hostnames and upstreams. It returns the
 // previous pool (nil if there was none) so the caller can drain it.
 func (p *Proxy) SetApp(name string, version int, hosts, addrs []string) *Pool {
-	pool := newPool(version, addrs)
+	pool := newPool(version, addrs, p.Dial)
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	r := p.apps[name]
@@ -202,6 +209,19 @@ func (p *Proxy) resumeLocked(r *route) {
 	if ch := r.gate.Swap(nil); ch != nil {
 		close(*ch)
 	}
+}
+
+// inFlight counts requests being served across all apps.
+func (p *Proxy) inFlight() int64 {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	var n int64
+	for _, r := range p.apps {
+		if pool := r.pool.Load(); pool != nil {
+			n += pool.InFlight()
+		}
+	}
+	return n
 }
 
 // Pool returns the app's current pool, or nil.

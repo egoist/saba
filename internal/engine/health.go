@@ -13,12 +13,19 @@ import (
 	"github.com/egoist/saba/internal/store"
 )
 
-var healthClient = &http.Client{
-	Timeout: 5 * time.Second,
-	CheckRedirect: func(*http.Request, []*http.Request) error {
-		return http.ErrUseLastResponse
-	},
-	Transport: &http.Transport{DisableKeepAlives: true},
+func (e *Engine) healthClient() *http.Client {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.health == nil {
+		e.health = &http.Client{
+			Timeout: 5 * time.Second,
+			CheckRedirect: func(*http.Request, []*http.Request) error {
+				return http.ErrUseLastResponse
+			},
+			Transport: &http.Transport{DisableKeepAlives: true, DialContext: e.Dial},
+		}
+	}
+	return e.health
 }
 
 type healthSpec struct {
@@ -119,9 +126,7 @@ func (e *Engine) waitHealthy(ctx context.Context, r *Run, a *store.AppRecord, de
 			r.logf("deploy", "%s produced no output.", out.rep.Container)
 		}
 		out.err.WithDetail("replica", out.rep.Index).WithDetail("version", dep.Version)
-		if out.rep.Addr != "" && spec.mode == "http" {
-			out.err.Hint = fmt.Sprintf("Node %s is in direct mode: the primary must be able to reach %s:%d over the private network (check firewalls). ", out.rep.Node, out.rep.Addr, out.rep.HostPort) + out.err.Hint
-		}
+
 		if spec.mode == "http" {
 			if img, ierr := e.RT.InspectImage(lctx, dep.Image); ierr == nil && len(img.ExposedPorts) > 0 && !containsInt(img.ExposedPorts, dep.Port) {
 				out.err.Hint = fmt.Sprintf("The image exposes port %d but the app is configured with port %d — try `port = %d`. ", img.ExposedPorts[0], dep.Port, img.ExposedPorts[0]) + out.err.Hint
@@ -212,7 +217,7 @@ func (e *Engine) probe(ctx context.Context, spec healthSpec, c *runtime.Containe
 			req.Host = spec.host
 		}
 		req.Header.Set("User-Agent", "saba-health/1")
-		resp, err := healthClient.Do(req)
+		resp, err := e.healthClient().Do(req)
 		if err != nil {
 			return false, "the app is not answering HTTP requests"
 		}

@@ -46,7 +46,6 @@ func (d *Daemon) routes() http.Handler {
 
 	h("GET /v1/nodes", d.handleNodes)
 	h("POST /v1/nodes", d.handleNodeAdd)
-	h("GET /v1/nodes/key", d.handleNodeKey)
 	h("DELETE /v1/nodes/{node}", d.handleNodeRemove)
 
 	h("GET /v1/apps", d.handleApps)

@@ -11,6 +11,7 @@ import (
 
 	"golang.org/x/crypto/acme"
 	"golang.org/x/crypto/acme/autocert"
+	"golang.org/x/net/http2"
 )
 
 // TLS modes.
@@ -38,6 +39,16 @@ type ServerOptions struct {
 	Certs func(serverName string) *tls.Certificate
 	// ACMEClient overrides the HTTP client used to talk to the CA.
 	ACMEClient *http.Client
+	// Cluster connections share the HTTPS port: TLS handshakes offering
+	// ClusterALPN get ClusterTLS and are handed to Cluster, which serves the
+	// connection until it ends.
+	ClusterALPN string
+	ClusterTLS  *tls.Config
+	Cluster     func(*tls.Conn)
+	// OnDrained runs during shutdown once proxied requests have finished (or
+	// the grace period passed), before waiting for remaining connections.
+	// Long-lived cluster connections should be closed there.
+	OnDrained func()
 }
 
 func listen(inherited net.Listener, addr string) (net.Listener, error) {
@@ -114,6 +125,23 @@ func (p *Proxy) Listen(opts ServerOptions) (*Server, error) {
 			IdleTimeout:       120 * time.Second,
 			ErrorLog:          quietLog(p),
 		}
+		if opts.Cluster != nil && opts.ClusterTLS != nil {
+			tlsConf.GetConfigForClient = func(hello *tls.ClientHelloInfo) (*tls.Config, error) {
+				for _, proto := range hello.SupportedProtos {
+					if proto == opts.ClusterALPN {
+						return opts.ClusterTLS, nil
+					}
+				}
+				return nil, nil
+			}
+			s.https.TLSNextProto = map[string]func(*http.Server, *tls.Conn, http.Handler){
+				opts.ClusterALPN: func(_ *http.Server, c *tls.Conn, _ http.Handler) { opts.Cluster(c) },
+			}
+			// A custom TLSNextProto turns off Go's automatic HTTP/2; turn it back on.
+			if err := http2.ConfigureServer(s.https, nil); err != nil {
+				return nil, err
+			}
+		}
 		l, err := listen(opts.HTTPSListener, opts.HTTPSAddr)
 		if err != nil {
 			return nil, err
@@ -170,6 +198,14 @@ func (s *Server) Serve(ctx context.Context) error {
 		}
 		done <- struct{}{}
 	}()
+	// Requests to replicas on other nodes travel over cluster connections, so
+	// those may only close once no request is in flight.
+	for s.proxy.inFlight() > 0 && shutCtx.Err() == nil {
+		time.Sleep(25 * time.Millisecond)
+	}
+	if s.opts.OnDrained != nil {
+		s.opts.OnDrained()
+	}
 	<-done
 	<-done
 	return nil

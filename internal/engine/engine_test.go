@@ -42,6 +42,7 @@ func newHarness(t *testing.T) *harness {
 	rt := runtimetest.New()
 	px := proxy.New(nil)
 	e := New(st, rt, px, dir, nil)
+	px.Dial = e.Dial
 	e.HealthInterval = 5 * time.Millisecond
 	e.StableWindow = 20 * time.Millisecond
 	e.PortMin, e.PortMax = 31000, 31999

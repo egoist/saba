@@ -85,11 +85,22 @@ func (d *Daemon) handleDoctor(w http.ResponseWriter, r *http.Request) error {
 
 	status := d.cluster.Status()
 	for _, name := range sortedKeys(st.Nodes) {
-		if ns := status[name]; ns.Up {
-			add("node:"+name, true, "Connected (Docker "+ns.Docker+")", "")
-		} else {
-			add("node:"+name, false, "Unreachable: "+ns.Error,
-				fmt.Sprintf("Its replicas are out of rotation until it is back. Check the server and that `ssh %s` works from the primary; saba reconnects on its own.", st.Nodes[name].SSH))
+		n := d.nodeView(*st.Nodes[name], status, nil)
+		switch n.Status {
+		case "connected":
+			msg := "Connected (Docker " + n.Docker + ", saba " + n.Version + ")"
+			if n.Version != d.opts.Version {
+				add("node:"+name, false, msg+": the agent runs another version than the primary",
+					"Agents upgrade themselves to the primary's release; for development builds, install the same build on the node.")
+				continue
+			}
+			add("node:"+name, true, msg, "")
+		case "pending":
+			add("node:"+name, false, "Waiting for the agent to join",
+				fmt.Sprintf("Run the join command from `saba node add %s` on the node, or get a new one with `saba node add %s --rejoin`.", name, name))
+		default:
+			add("node:"+name, false, "Unreachable: "+n.Error,
+				fmt.Sprintf("Its replicas are out of rotation until it is back. On the node, check `systemctl status saba-agent` and `journalctl -u saba-agent`; the agent reconnects by itself."))
 		}
 	}
 	for name, msg := range d.issuer.Failures() {

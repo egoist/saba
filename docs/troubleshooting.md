@@ -165,23 +165,39 @@ or configure the Cloudflare token. See [Behind Cloudflare's proxy](domains-and-h
 
 ## Nodes
 
-### `node ... refuses SSH forwarding`
+### A node stays `pending`
 
-The node's `sshd` has forwarding disabled. Set `AllowTcpForwarding yes` and
-`AllowStreamLocalForwarding yes` in `/etc/ssh/sshd_config` on the node, restart `sshd`, and run
-`saba node add` again.
+Its agent has not joined. Run the commands `saba node add <name>` printed on the node, or
+`saba node add <name> --rejoin` for a new join code (the old one stops working after 24 hours or
+once used).
 
 ### A node shows `unreachable`
 
-`saba node list` shows the last error. Check that the node is up and that
-`ssh <node destination>` works from the primary. saba reconnects on its own once it can; replicas
-on the node come back without a deploy.
+`saba node list` shows when it disconnected. On the node:
 
-### Replicas on a direct-mode node fail their health check
+```sh
+systemctl status saba-agent
+journalctl -u saba-agent -n 50
+```
 
-The primary cannot reach the node's private address on the replica ports (20000–29999). Allow
-that range from the primary in the node's firewall, or switch back to the tunnel by running
-`saba node add` again without `--direct`.
+The agent's log says why it cannot connect:
+
+- **connection refused or timed out**: the node cannot reach the primary's address on port 443
+  (7443 with `--tls off`). Check the primary's firewall, or join with a `--primary-address`
+  the node can reach.
+- **the primary refused this node**: the node was removed, or its key changed because it was
+  reinstalled. Run `saba node add <name> --rejoin` and use the new code.
+- **the primary's key is ..., but this node joined ...**: the agent reached a different server
+  than the one it joined, or the primary's data directory was replaced. Rejoin the node.
+
+The agent reconnects on its own once the cause is fixed; its replicas come back without a deploy.
+
+### `the agent runs another version than the primary`
+
+Agents upgrade themselves to the primary's release when they connect. That fails when the node
+cannot download from GitHub (the agent's log says so), and never happens for development
+builds: install the same build on the node, e.g. `saba node add <name> <user@host> --binary
+./dist/saba-linux-amd64 --rejoin`.
 
 ## Backups
 

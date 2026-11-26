@@ -14,8 +14,10 @@ In practice, whoever has an SSH key accepted for root (or for a user in the `doc
 with sudo) on a server controls all apps on it, their secrets and their data. There are no
 per-user or per-app permissions. Give separate teams or environments separate servers.
 
-A **primary controls its nodes**: it holds a private key accepted by each node, for a user that
-can run Docker there. Compromising the primary compromises the cluster.
+A **primary controls its nodes**: each node's agent gives the primary full use of its Docker
+engine. Compromising the primary compromises the cluster. The reverse is not true: an agent can
+only report heartbeats to the primary, and the primary holds no SSH key or password for its
+nodes.
 
 ## What is exposed
 
@@ -23,14 +25,13 @@ can run Docker there. Compromising the primary compromises the cluster.
 |---|---|
 | 22 | Your SSH server, as configured. saba does not change it |
 | 80 | HTTP: ACME challenges, redirects to HTTPS |
-| 443 | HTTPS for routed apps |
+| 443 | HTTPS for routed apps, and agent connections from nodes |
+| 7443 | Agent connections, only when the primary runs with `--tls off` |
 
 Nothing else: the control API is a unix socket, databases and internal apps are reachable only
-from containers on the server, and replica ports are bound to the loopback interface. Exceptions
-you create yourself:
-
-- `publish` ports, which bind wherever you tell them to,
-- nodes in direct mode, whose replica ports are open on their private address.
+from containers on the server, and replica ports are bound to the loopback interface. Nodes open
+no ports at all; their agent connects out. The exception you create yourself is `publish`, which
+binds wherever you tell it to.
 
 Requests for hostnames not routed to an app get a 404 and no certificate.
 
@@ -56,10 +57,10 @@ Back up `state.json` as carefully as the secrets in it.
 ## Transport
 
 - CLI to server: SSH, with your keys and your host-key checking.
-- Primary to nodes: SSH with a key generated on the primary, verifying the host keys read during
-  `saba node add` (or trusting the first key seen with `--no-authorize`). Replica traffic goes
-  through that SSH connection unless a node is in direct mode, which is plain HTTP over the
-  private network; only private addresses are accepted for it.
+- Nodes to primary: TLS 1.3, opened by the node's agent. Each side recognizes the other by a
+  pinned key: the agent learns the primary's from the join code, and the primary pins the
+  agent's when it first joins with its one-time token (stored only as a hash, valid for 24
+  hours). Docker control and replica traffic both travel over this connection.
 - Clients to apps: TLS 1.2 or newer, with HSTS (`max-age=31536000`). HTTP requests to routed
   hosts are redirected to HTTPS.
 - To S3: HTTPS, unless you configure an `http://` endpoint. Requests are signed with AWS
@@ -89,8 +90,8 @@ Dumps contain all of a database's data and are not encrypted by saba. On the ser
 
 - [ ] SSH: key authentication only (`PasswordAuthentication no`), and a dedicated deploy key for
       CI, ideally restricted with `from=` in `authorized_keys`.
-- [ ] A firewall allowing only 22, 80 and 443 from the internet (and the private network for
-      nodes in direct mode).
+- [ ] A firewall allowing only 22, 80 and 443 to the primary (plus 7443 from nodes with
+      `--tls off`). Nodes need no inbound ports besides your SSH.
 - [ ] Unattended security updates for the OS; keep Docker updated.
 - [ ] Never `publish` a database on a public interface; use `127.0.0.1:` and an SSH tunnel.
 - [ ] Resource limits (`[resources]`) on apps you do not fully trust.

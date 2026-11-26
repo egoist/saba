@@ -106,8 +106,10 @@ saba server setup <user@host> [--name N] [--email E] [--base-domain D] [--instal
                               server (same version as this CLI by default). Re-run to upgrade.
 saba server info | config | config set <key> <value|-> | prune
      keys: base_domain acme_email keep_versions address cloudflare_api_token dns_hook
-saba node [list] | add <name> <user@host> [--address IP] [--direct] [--no-authorize]
-saba node remove <name> --yes | key
+saba node [list] | add <name> [user@host] [--address IP] [--primary-address HOST] [--rejoin]
+                  [--install-docker] [--binary FILE]
+saba node remove <name> --yes [--keep-agent]
+saba agent install --join <code> | run | uninstall       (on a node, as root)
 saba certs [list] | add --cert <chain.pem> --key <key.pem> | remove <id> --yes
 saba mcp                      MCP server on stdio (same tools as this CLI)
 saba guide                    This document
@@ -222,25 +224,31 @@ uploaded later automatically. Disaster recovery on a new server: configure the s
 
 ## Multiple servers
 
-The server running the daemon is the primary, node `local`. `saba node add <name> <user@host>`
-adds a worker: it needs Docker and SSH access from the primary, nothing else. The command logs
-in to the node from the machine running the CLI to authorize the primary's key; if only the
-primary can reach the node, authorize the key from `saba node key` by hand and pass
-`--no-authorize`.
+The server running the daemon is the primary, node `local`. Every other node runs `saba agent`
+(the same binary, as the `saba-agent` systemd service). The agent connects **out** to the
+primary over TLS (its HTTPS port, or `--cluster-addr`, default 7443, with `--tls off`), and that
+connection carries Docker control and replica traffic. Nodes need Docker and no open ports.
 
+- `saba node add <name> <user@host>` installs everything over SSH (root or passwordless sudo;
+  `--install-docker` if needed) and waits for the agent to connect.
+- `saba node add <name>` without a destination prints two commands to run on the node (for
+  machines behind NAT). The join code is single-use, valid 24 h; `--rejoin` issues a new one and
+  forgets the node's key (needed after reinstalling a machine).
+- The agent dials `--primary-address`, else the primary's `address` setting, else its public IP.
+- Status: `pending` (not joined), `connected`, `unreachable` (with the last error).
+  `saba node list` shows the agent's saba and Docker versions, load, memory and disk.
+- Agents upgrade themselves to the primary's release on connect (checksum-verified).
 - `nodes = ["local", "w1"]` (or `--node`, repeatable) spreads replicas round-robin; `["*"]`
   uses every server. Containers report their node in `saba status` and get `SABA_NODE`.
-- Images are built on the primary and sent to nodes automatically.
-- Traffic to a node's replicas goes through the SSH connection (encrypted, zero setup). On a
-  private network, `saba node add <name> <user@host> --address <private-ip> --direct` makes the
-  primary connect to replicas directly instead: faster, unencrypted, private addresses only.
-  Re-run `node add` to change a node; apps pick the change up on their next deploy or restart.
-- An unreachable node shows as `unreachable` in `saba node list` and `saba doctor`; its replicas
-  leave the rotation and the app shows `degraded`. saba reconnects by itself.
+- Images are built on the primary and streamed to nodes over the agent connection.
+- An unreachable node's replicas leave the rotation; the app shows `degraded`. When the agent
+  reconnects, the primary reconciles the node and its replicas return without a deploy.
 - Apps with `volumes` and databases must use exactly one node.
 - Container names (`http://api:8080`, `main:5432`) resolve only between containers on the same
   server. An app with `publish` ports is additionally resolvable by name from other nodes, at
-  its server's `address` (set with `saba node add --address` / `saba server config set address`).
+  its server's `address` (`saba node add --address` / `saba server config set address`).
+- `saba node remove` refuses while apps are placed on the node, then uninstalls the agent over
+  SSH when it was installed that way.
 
 ## Certificates
 
@@ -293,7 +301,8 @@ DeployResult { app, deployed, saved, dry_run, deployment, urls[], plan[] }     #
                                                          # scale, rollback, env set, domains add
 exec/run     { exit_code, stdout, stderr }
 doctor       { ok, checks[{name, ok, message, hint}] }
-Node         { name, ssh, address, direct, status: connected|unreachable, error, docker_version, replicas }
+Node         { name, address, status: connected|unreachable|pending, error, version, docker_version,
+               hostname, platform, last_seen, stats{cpus, load1, mem_total, mem_used, disk_total, disk_used}, replicas }
 Backup       { id, app, file, kind: manual|scheduled, engine, size, created_at,
                location: local|s3|local+s3, warning }      # `backup create -o` adds saved_to
 Certificate  { id, names[], source: custom|dns, issuer, not_after, status: active|expired|pending|failed|skipped, error }

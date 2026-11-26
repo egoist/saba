@@ -40,7 +40,7 @@ The daemon is a single Go process. The code is organized as:
 | `internal/runtime` | The container runtime interface and its Docker implementation |
 | `internal/store` | The state file |
 | `internal/buildpack` | Stack detection and generated Dockerfiles |
-| `internal/cluster` | SSH connections to nodes |
+| `internal/cluster` | The agent, and the primary's side of agent connections |
 | `internal/certs` | Wildcard (DNS-01) issuance and the certificate store |
 | `internal/s3` | A small S3 client for backup mirroring |
 | `internal/cron` | Cron expression parsing |
@@ -79,8 +79,8 @@ Deployment logs are separate append-only NDJSON files, one per deployment.
 3. **Port.** Configured, or the image's first exposed TCP port, or none (worker).
 4. **Release command**, in a one-off container with the new image.
 5. **Ship** the image to nodes that will run replicas and do not have it.
-6. **Start replicas.** Each gets a free port in 20000–29999, published on the server's loopback
-   interface (or a node's private address in direct mode). Replicas start with restart policy
+6. **Start replicas.** Each gets a free port in 20000–29999, published on its server's loopback
+   interface. Replicas start with restart policy
    `no`, so a container that crashes on boot stays down with its real exit code.
 7. **Health checks**, in parallel for all replicas. On failure: capture the container's last log
    lines, remove the new containers and the image, record the error. Done; nothing else changed.
@@ -163,17 +163,33 @@ Once a minute, at the top of the minute (UTC), the daemon:
 
 ## The cluster
 
-For each node, the primary keeps one OpenSSH master connection (`ssh -M`), authenticated with
-the primary's own ed25519 key and pinned host keys. Through it:
+Every node runs `saba agent`, the same binary. The agent dials the primary: TLS 1.3 with the
+ALPN protocol `saba-cluster/1` on the primary's HTTPS port, so it shares port 443 with regular
+traffic. The primary's TLS listener hands those handshakes to the cluster manager instead of the
+HTTP server. With `--tls off` it uses a separate listener, `--cluster-addr` (default `:7443`).
 
-- the node's Docker socket is forwarded to `/run/saba/nodes/<node>.sock`, and the engine drives
-  the node with the regular Docker CLI pointed there,
-- each remote replica's port is forwarded to the same port on the primary's loopback, so the
-  proxy reaches it like a local replica (unless the node is in direct mode),
-- images are streamed with `docker save | docker load`, skipped when the node has the image.
+- **Identity.** Both sides have an ed25519 key with a self-signed certificate and recognize each
+  other by the key's fingerprint, not by a certificate authority. The join code carries the
+  primary's fingerprint and a one-time token; the primary pins the agent's key on first contact.
+- **Multiplexing.** After the handshake the connection runs yamux. The primary opens one stream
+  per Docker API connection and one per proxied request or health check. The agent connects
+  each stream to the node's Docker socket or to `127.0.0.1:<port>`, and refuses anything else.
+- **Docker.** For each node the primary exposes `/run/saba/nodes/<node>.sock`. The engine drives
+  the node with the regular Docker CLI pointed there, so every runtime operation (run, logs,
+  exec, stats, `save | load` for images) works the same locally and remotely.
+- **Replica traffic.** Remote replicas are addressed as `<node>.saba-node:<port>`. The proxy's
+  dialer recognizes that suffix and opens a stream through the node's agent. A failure is a
+  regular dial error, so the proxy fails over as it does for local replicas.
+- **Liveness.** yamux keep-alives detect a dead connection within seconds. The agent reconnects
+  with backoff; on every connect the primary reconciles the node's containers, skipping apps
+  that have an operation in progress.
+- **Heartbeats.** The agent sends its Docker version, load, memory and disk usage every ten
+  seconds on a stream of its own.
+- **Upgrades.** The primary tells the agent its version in the handshake. An agent on another
+  release downloads it, verifies the checksum, replaces itself and re-executes.
 
-A watcher checks each connection every 10 seconds and reconnects, restoring forwards, when one
-dropped. Keep-alives detect a dead node within about six seconds.
+The primary never needs to reach the node. That is what lets nodes sit behind NAT, and it means
+the primary holds no SSH key or other credential for its nodes.
 
 ## The Docker driver
 

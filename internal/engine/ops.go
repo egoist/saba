@@ -667,24 +667,41 @@ func (e *Engine) Reconcile(ctx context.Context) {
 		return nil
 	})
 	st := e.Store.Snapshot()
-	// Tunnels to remote replicas do not survive the daemon; restore them first.
-	if e.Nodes != nil {
-		for _, a := range st.Apps {
-			if cur := a.Current(); cur != nil {
-				for _, r := range cur.Replicas {
-					if tunneled(r) {
-						if err := e.Nodes.Forward(ctx, r.Node, r.HostPort); err != nil {
-							e.Log.Warn("cannot restore tunnel", "node", r.Node, "port", r.HostPort, "err", err)
-						}
-					}
-				}
-			}
-		}
-	}
 	all, err := e.list(ctx, map[string]string{LabelManaged: "true"})
 	if err != nil {
 		e.Log.Error("cannot list containers", "err", err)
 	}
+	e.reconcileContainers(ctx, st, all)
+	e.RefreshRoutes()
+}
+
+// ReconcileNode applies the same rules to one node, e.g. when its agent
+// (re)connects: containers there may have changed while it was away.
+func (e *Engine) ReconcileNode(ctx context.Context, node string) {
+	if e.Nodes == nil {
+		return
+	}
+	rt := e.Nodes.Runtime(node)
+	if err := rt.EnsureNetwork(ctx, Network); err != nil {
+		e.Log.Warn("cannot ensure the docker network on node", "node", node, "err", err)
+		return
+	}
+	cs, err := rt.List(ctx, map[string]string{LabelManaged: "true"})
+	if err != nil {
+		e.Log.Warn("cannot list containers on node", "node", node, "err", err)
+		return
+	}
+	for i := range cs {
+		cs[i].Node = node
+	}
+	e.reconcileContainers(ctx, e.Store.Snapshot(), cs)
+}
+
+// reconcileContainers removes containers that belong to no live version and
+// starts live ones that should be running. Apps with an operation in progress
+// are skipped: their new containers are not live yet, but they are not
+// leftovers either.
+func (e *Engine) reconcileContainers(ctx context.Context, st *store.State, all []runtime.Container) {
 	for _, c := range all {
 		a := st.Apps[c.Labels[LabelApp]]
 		if a == nil {
@@ -693,19 +710,20 @@ func (e *Engine) Reconcile(ctx context.Context) {
 			e.Log.Warn("container belongs to an app unknown to this daemon; leaving it alone", "container", c.Name, "app", c.Labels[LabelApp])
 			continue
 		}
+		if e.Busy(a.Name) {
+			continue
+		}
 		ver, _ := strconv.Atoi(c.Labels[LabelVersion])
 		orphan := c.Labels[LabelRole] != RoleApp || ver != a.CurrentVersion
 		switch {
 		case orphan:
-			e.Log.Info("removing orphaned container", "container", c.Name)
+			e.Log.Info("removing orphaned container", "container", c.Name, "node", c.Node)
 			_ = e.rt(c.Node).Remove(ctx, c.Name)
-			e.unforward(ctx, &c)
 		case !a.Stopped && !c.Running() && c.State != "restarting":
-			e.Log.Info("starting container", "container", c.Name)
+			e.Log.Info("starting container", "container", c.Name, "node", c.Node)
 			if err := e.rt(c.Node).Start(ctx, c.Name); err != nil {
 				e.Log.Warn("cannot start container", "container", c.Name, "err", err)
 			}
 		}
 	}
-	e.RefreshRoutes()
 }

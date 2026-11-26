@@ -2,30 +2,47 @@ package engine
 
 import (
 	"context"
+	"fmt"
 	"io"
+	"net"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/egoist/saba/internal/api"
 	"github.com/egoist/saba/internal/runtime"
 	"github.com/egoist/saba/internal/store"
 )
 
-// LabelPort records the loopback port a replica is reachable on from the primary.
-const LabelPort = "saba.port"
-
-// Nodes gives the engine access to the other servers of a cluster. The
-// primary reaches every remote replica on a local port that is forwarded to
-// the node, so the proxy and health checks treat all replicas alike.
+// Nodes gives the engine access to the other servers of a cluster, through
+// the agents running on them.
 type Nodes interface {
 	// Runtime returns the container runtime of a remote node.
 	Runtime(node string) runtime.Runtime
-	// Forward makes 127.0.0.1:port on the primary reach 127.0.0.1:port on the node.
-	Forward(ctx context.Context, node string, port int) error
-	// Unforward undoes Forward.
-	Unforward(ctx context.Context, node string, port int)
+	// Dial connects to a port on the node's loopback interface, where its
+	// replicas publish their ports.
+	Dial(ctx context.Context, node string, port int) (net.Conn, error)
+}
+
+// nodeHostSuffix marks replica addresses on other nodes: "<node>.saba-node:<port>".
+const nodeHostSuffix = ".saba-node"
+
+// Dial connects to a replica address: a loopback port on the primary, or a
+// "<node>.saba-node:<port>" address reached through that node's agent. The
+// proxy and the health checks use it for every replica.
+func (e *Engine) Dial(ctx context.Context, network, addr string) (net.Conn, error) {
+	host, portStr, err := net.SplitHostPort(addr)
+	if node, ok := strings.CutSuffix(host, nodeHostSuffix); err == nil && ok {
+		port, perr := strconv.Atoi(portStr)
+		if perr != nil || e.Nodes == nil {
+			return nil, &net.OpError{Op: "dial", Net: network, Err: fmt.Errorf("cannot reach %s", addr)}
+		}
+		return e.Nodes.Dial(ctx, node, port)
+	}
+	d := net.Dialer{Timeout: 5 * time.Second, KeepAlive: 30 * time.Second}
+	return d.DialContext(ctx, network, addr)
 }
 
 func isLocal(node string) bool { return node == "" || node == api.LocalNode }
@@ -220,16 +237,6 @@ func portConflict(err error) bool {
 	}
 	m := err.Error()
 	return strings.Contains(m, "port is already allocated") || strings.Contains(m, "address already in use")
-}
-
-// unforward releases the tunnel of a remote container, if it has one.
-func (e *Engine) unforward(ctx context.Context, c *runtime.Container) {
-	if isLocal(c.Node) || e.Nodes == nil {
-		return
-	}
-	if port, err := strconv.Atoi(c.Labels[LabelPort]); err == nil && port > 0 {
-		e.Nodes.Unforward(ctx, c.Node, port)
-	}
 }
 
 // removeImage removes an image tag from the primary and from every node.

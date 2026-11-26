@@ -56,7 +56,7 @@ $ cd my-app && saba deploy
 | Cron | Scheduled commands in the app's image |
 | Operations | Logs, exec, one-off runs, stats, `saba doctor` diagnostics |
 | Upgrades | The daemon restarts without refusing or dropping requests (systemd socket activation) |
-| Multi-server | Add worker nodes over SSH; named contexts for separate environments |
+| Multi-server | Worker nodes run an agent that connects out to the primary (no open ports, works behind NAT); named contexts for separate environments |
 
 ## Documentation
 
@@ -143,7 +143,8 @@ Run `saba --help`, `saba <command> --help` or `saba guide` for everything else, 
 ## Scaling across servers
 
 One server is the primary: it runs the saba daemon, terminates HTTPS and load-balances. Any
-other Linux box with Docker becomes a worker node — nothing to install on it, no ports to open:
+other Linux box with Docker becomes a worker node by running the saba agent, which
+`saba node add` installs over SSH:
 
 ```sh
 saba node add worker1 root@10.0.0.2
@@ -152,20 +153,12 @@ saba deploy -a web --node local --node worker1 --replicas 4    # 2 replicas per 
 
 or in `saba.toml`: `nodes = ["local", "worker1"]` (`["*"]` means every server).
 
-The primary drives each node's Docker engine and reaches its replicas through one persistent
-SSH connection, so traffic between servers is encrypted and needs no private network. Rolling
-deploys, rollbacks, logs, exec and stats work the same across servers. If a node goes down, its
-replicas drop out of rotation and come back on their own when it returns.
-
-When the servers share a private network (a VPC, WireGuard, Tailscale), skip the tunnel for
-request traffic and let the primary connect to replicas straight over that network:
-
-```sh
-saba node add worker1 root@10.0.0.2 --address 10.0.0.2 --direct
-```
-
-That is faster, and unencrypted: replica ports are open on the node's private address, so it is
-only accepted for private addresses. Docker is still driven over SSH either way.
+The agent connects **out** to the primary over TLS, and that one connection carries Docker
+control and the traffic to the node's replicas. Nodes need no open ports and can sit behind NAT:
+`saba node add homelab` without an SSH destination prints a join command to run on the machine
+instead. Rolling deploys, rollbacks, logs, exec and stats work the same across servers. If a
+node goes down, its replicas drop out of rotation and come back on their own when it returns.
+Agents keep themselves on the primary's version.
 
 Two things stay per-server: volumes (apps with volumes and databases run on one node), and
 container names — `http://api:8080` resolves between containers on the same server. An app that
@@ -245,6 +238,13 @@ An [MCP](https://modelcontextprotocol.io) server exposes the same operations as 
                                       │   ┌────▼─────┐ ┌──────────┐ ┌──────────┐     │
                                       │   │ web v7-1 │ │ web v7-2 │ │ postgres │ ... │
                                       │   └──────────┘ └──────────┘ └──────────┘     │
+                                      └──────────────────────▲───────────────────────┘
+                                                             │ TLS :443, opened by the agent
+                                      ┌──────────────────────┴───────────────────────┐
+                                      │ worker node: saba agent + docker             │
+                                      │   ┌──────────┐ ┌──────────┐                  │
+                                      │   │ web v7-3 │ │ web v7-4 │ ...              │
+                                      │   └──────────┘ └──────────┘                  │
                                       └──────────────────────────────────────────────┘
 ```
 

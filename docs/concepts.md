@@ -100,7 +100,7 @@ setting, set it to an empty value. See
   name on your machine (`prod`, `staging`) pointing at an SSH destination. Contexts keep
   separate environments separate; each server has its own apps.
 - A server can grow into a cluster: its daemon is the **primary** (node `local`), and you add
-  **worker nodes**, plain Docker hosts reached over SSH, to run more replicas. The primary still
+  **worker nodes**, Docker hosts running the saba agent, to run more replicas. The primary still
   terminates all traffic and holds all state. See [Scaling](scaling.md).
 
 ## The proxy

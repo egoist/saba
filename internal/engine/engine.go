@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"math/rand/v2"
 	"net"
+	"net/http"
 	"path/filepath"
 	"regexp"
 	"sort"
@@ -67,7 +68,8 @@ type Engine struct {
 	// nil when none is configured.
 	RemoteBackups func() RemoteStore
 	remoteErr     string
-	needSync      bool                   // an upload failed; local-only backups await a catch-up
+	needSync      bool // an upload failed; local-only backups await a catch-up
+	health        *http.Client
 	lastBackup    map[string]time.Time   // newest backup id handed out per database
 	backupLocks   map[string]*sync.Mutex // one backup or restore per database at a time
 	wg            sync.WaitGroup         // in-flight deployments, including their cleanup
@@ -372,13 +374,11 @@ func bg(parent context.Context, d time.Duration) (context.Context, context.Cance
 	return context.WithTimeout(context.WithoutCancel(parent), d)
 }
 
-// replicaHost is the address the primary uses to reach a replica.
+// replicaHost is the host part of the address the primary uses to reach a
+// replica: loopback for local ones, the node's agent for the others.
 func replicaHost(r api.Replica) string {
-	if r.Addr != "" {
-		return r.Addr
+	if isLocal(r.Node) {
+		return "127.0.0.1"
 	}
-	return "127.0.0.1"
+	return r.Node + nodeHostSuffix
 }
-
-// tunneled reports whether a replica is reached through an SSH port forward.
-func tunneled(r api.Replica) bool { return !isLocal(r.Node) && r.Addr == "" && r.HostPort > 0 }

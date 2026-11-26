@@ -1,7 +1,6 @@
 package cli
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -388,34 +387,6 @@ Requirements: SSH access as root or a user with passwordless sudo, and ports
 
 func (c *CLI) setup(ctx context.Context, target string, f *setupFlags) error {
 	ui := newUI(c.stderr, c.noColor)
-	step := func(format string, args ...any) {
-		fmt.Fprintf(c.stderr, "%s %s\n", ui.cyan("▶"), fmt.Sprintf(format, args...))
-	}
-	// ssh runs a remote shell snippet, optionally feeding stdin.
-	ssh := func(script string, stdin io.Reader, show bool) (string, error) {
-		argv := client.SSHCommand(target, false, script)
-		cmd := exec.CommandContext(ctx, argv[0], argv[1:]...)
-		var out, errb bytes.Buffer
-		cmd.Stdin = stdin
-		cmd.Stdout = &out
-		cmd.Stderr = &errb
-		if show {
-			cmd.Stdout = io.MultiWriter(&out, prefixWriter{c.stderr, "  " + ui.dim("│ ")})
-			cmd.Stderr = io.MultiWriter(&errb, prefixWriter{c.stderr, "  " + ui.dim("│ ")})
-		}
-		// A persistent ssh master must not keep Run waiting on inherited pipes.
-		cmd.WaitDelay = 2 * time.Second
-		err := cmd.Run()
-		if err != nil && err != exec.ErrWaitDelay {
-			msg := strings.TrimSpace(errb.String())
-			if msg == "" {
-				msg = strings.TrimSpace(out.String())
-			}
-			return out.String(), fmt.Errorf("%s", lastLine(orDash(msg)))
-		}
-		return out.String(), nil
-	}
-
 	// Validate input before touching the network.
 	tag, err := releaseTag(f.version, Version)
 	if err != nil {
@@ -426,80 +397,18 @@ func (c *CLI) setup(ctx context.Context, target string, f *setupFlags) error {
 			return api.Errorf(api.CodeInvalid, "cannot read binary %s: %v", f.binary, err)
 		}
 	}
-
-	step("Connecting to %s", target)
-	probe, err := ssh(`echo "os=$(uname -s) arch=$(uname -m) uid=$(id -u)"; command -v docker >/dev/null 2>&1 && echo docker=yes || echo docker=no; command -v systemctl >/dev/null 2>&1 && echo systemd=yes || echo systemd=no`, nil, false)
-	if err != nil {
-		return api.Errorf(api.CodeUnreachable, "cannot connect to %s: %v", target, err).
-			WithHint("Check that `ssh %s` works non-interactively (key-based auth, host key accepted).", target)
+	host := c.newRemote(ctx, target, "server")
+	step, ssh := host.step, host.run
+	if err := host.probe(); err != nil {
+		return err
 	}
-	facts := map[string]string{}
-	for _, f := range strings.Fields(probe) {
-		if k, v, ok := strings.Cut(f, "="); ok {
-			facts[k] = v
-		}
+	if err := host.ensureDocker(f.installDocker); err != nil {
+		return err
 	}
-	if facts["os"] != "Linux" {
-		return api.Errorf(api.CodeInvalid, "the server runs %s; saba servers must run Linux", orDash(facts["os"]))
+	if err := host.installBinary(f.binary, tag); err != nil {
+		return err
 	}
-	if facts["systemd"] != "yes" {
-		return api.Errorf(api.CodeInvalid, "the server does not use systemd").
-			WithHint("Run the daemon yourself with `saba daemon` under your init system.")
-	}
-	arch := map[string]string{"x86_64": "amd64", "aarch64": "arm64", "arm64": "arm64"}[facts["arch"]]
-	if arch == "" {
-		return api.Errorf(api.CodeInvalid, "unsupported server architecture %q", facts["arch"])
-	}
-	sudo := ""
-	if facts["uid"] != "0" {
-		sudo = "sudo -n "
-		if _, err := ssh("sudo -n true", nil, false); err != nil {
-			return api.Errorf(api.CodeInvalid, "%s is not root and cannot use sudo without a password", target).
-				WithHint("Connect as root, or allow passwordless sudo for this user.")
-		}
-	}
-
-	if facts["docker"] != "yes" {
-		if !f.installDocker {
-			return api.Errorf(api.CodeInvalid, "Docker is not installed on the server").
-				WithHint("Re-run with --install-docker to install it with the official script (https://get.docker.com).")
-		}
-		step("Installing Docker")
-		if _, err := ssh("curl -fsSL https://get.docker.com | "+sudo+"sh", nil, true); err != nil {
-			return api.Errorf(api.CodeRuntime, "installing Docker failed: %v", err)
-		}
-	}
-
-	// The server downloads its own binary from GitHub releases. --binary
-	// uploads a local build instead, for versions that were never released.
-	const dest = "/usr/local/bin/saba"
-	if f.binary != "" {
-		file, err := os.Open(f.binary)
-		if err != nil {
-			return api.Errorf(api.CodeInvalid, "cannot read binary %s: %v", f.binary, err)
-		}
-		defer file.Close()
-		step("Uploading %s (linux/%s)", f.binary, arch)
-		upload := sudo + `sh -c 'cat > ` + dest + `.new && chmod 755 ` + dest + `.new && ` + dest + `.new --version >/dev/null && mv -f ` + dest + `.new ` + dest + `'`
-		if _, err := ssh(upload, file, false); err != nil {
-			return api.Errorf(api.CodeRuntime, "installing the uploaded binary failed: %v", err).
-				WithHint("The binary must be built for the server: linux/%s.", arch)
-		}
-	} else {
-		asset := "saba-linux-" + arch
-		url := releaseAsset(releasesURL, tag, asset)
-		label := tag
-		if label == "" {
-			label = "latest release"
-		}
-		step("Downloading saba %s (linux/%s) from GitHub", label, arch)
-		script := installScript(dest, url, releaseAsset(releasesURL, tag, "checksums.txt"), asset)
-		if _, err := ssh(sudo+"sh -c "+shellwords.Quote(script), nil, false); err != nil {
-			return api.Errorf(api.CodeRuntime, "installing saba on the server failed: %v", err).
-				WithDetail("url", url).
-				WithHint("Check that the release exists (%s) and that the server can reach github.com. Pick a release with --version <tag>.", releasesURL)
-		}
-	}
+	sudo := host.sudo
 
 	step("Installing the saba service")
 	args := []string{"saba", "daemon", "install", "--tls", f.tls, "--base-domain", f.baseDomain}
@@ -608,7 +517,7 @@ func (p prefixWriter) Write(b []byte) (int, error) {
 // ---- daemon ----------------------------------------------------------------
 
 type daemonFlags struct {
-	dataDir, socket, http, https, tls, email, baseDomain, acmeDir, acmeCA string
+	dataDir, socket, http, https, tls, email, baseDomain, acmeDir, acmeCA, cluster string
 }
 
 func (f *daemonFlags) register(cmd *cobra.Command) {
@@ -622,10 +531,11 @@ func (f *daemonFlags) register(cmd *cobra.Command) {
 	fl.StringVar(&f.baseDomain, "base-domain", "", "Base domain for app URLs; \"auto\" derives <public-ip>.sslip.io (stored on first start)")
 	fl.StringVar(&f.acmeDir, "acme-directory", "", "Alternative ACME directory URL (e.g. Let's Encrypt staging)")
 	fl.StringVar(&f.acmeCA, "acme-ca-file", "", "Extra root certificate to trust for the ACME directory (private or test CAs)")
+	fl.StringVar(&f.cluster, "cluster-addr", ":7443", "Where nodes connect when --tls is off (with TLS they use the HTTPS port)")
 }
 
 func (f *daemonFlags) args() []string {
-	args := []string{"daemon", "--data-dir", f.dataDir, "--socket", f.socket, "--http", f.http, "--https", f.https, "--tls", f.tls}
+	args := []string{"daemon", "--data-dir", f.dataDir, "--socket", f.socket, "--http", f.http, "--https", f.https, "--tls", f.tls, "--cluster-addr", f.cluster}
 	if f.email != "" {
 		args = append(args, "--acme-email", f.email)
 	}
@@ -720,7 +630,7 @@ For local experiments, run it unprivileged:
 			err := daemon.Run(cmd.Context(), daemon.Options{
 				Version: Version, DataDir: f.dataDir, Socket: f.socket,
 				HTTPAddr: f.http, HTTPSAddr: f.https, TLS: f.tls,
-				ACMEEmail: f.email, BaseDomain: f.baseDomain, ACMEDirectory: f.acmeDir, ACMECAFile: f.acmeCA, Log: log,
+				ACMEEmail: f.email, BaseDomain: f.baseDomain, ACMEDirectory: f.acmeDir, ACMECAFile: f.acmeCA, ClusterAddr: f.cluster, Log: log,
 			})
 			if err != nil {
 				return api.Errorf(api.CodeRuntime, "%v", err)

@@ -197,10 +197,7 @@ type Source struct {
 
 type Replica struct {
 	// Node is the server the replica runs on; empty means the primary.
-	Node string `json:"node,omitempty"`
-	// Addr is the address the replica is published on when the primary
-	// reaches it directly; empty means loopback (local, or an SSH tunnel).
-	Addr        string `json:"addr,omitempty"`
+	Node        string `json:"node,omitempty"`
 	Index       int    `json:"index"`
 	Container   string `json:"container"`
 	ContainerID string `json:"container_id,omitempty"`
@@ -379,28 +376,62 @@ type Certificate struct {
 // LocalNode is the name of the server the daemon itself runs on.
 const LocalNode = "local"
 
-// Node is an additional server that runs replicas. The primary drives its
-// Docker engine through a persistent SSH connection.
+// Node is an additional server that runs replicas. A saba agent on the node
+// connects out to the primary and carries Docker control and replica traffic.
 type Node struct {
 	Name string `json:"name"`
-	// SSH is the destination as reachable from the primary: user@host or ssh://user@host:port.
+	// SSH is the destination the agent was installed through, if any.
 	SSH string `json:"ssh,omitempty"`
 	// Address is the node's address on the network shared with the other
 	// nodes (optional); see ServerConfig.Address.
 	Address string `json:"address,omitempty"`
-	// Direct makes the primary send traffic for this node's replicas straight
-	// to Address instead of through the SSH tunnel. Faster, unencrypted: only
-	// for a private network between the servers.
-	Direct bool `json:"direct,omitempty"`
-	// HostKeys pins the node's SSH host keys (known_hosts key fields).
-	HostKeys  []string  `json:"host_keys,omitempty"`
-	CreatedAt time.Time `json:"created_at"`
+	// KeyFingerprint pins the agent's key, recorded when it first joined.
+	KeyFingerprint string `json:"key_fingerprint,omitempty"`
+	// TokenHash and TokenExpires describe the pending one-time join token.
+	// Never returned by the API.
+	TokenHash    string    `json:"token_hash,omitempty"`
+	TokenExpires time.Time `json:"token_expires,omitzero"`
+	JoinedAt     time.Time `json:"joined_at,omitzero"`
+	CreatedAt    time.Time `json:"created_at"`
 
 	// Derived on read.
-	Status   string `json:"status,omitempty"` // connected | unreachable
-	Error    string `json:"error,omitempty"`
-	Docker   string `json:"docker_version,omitempty"`
-	Replicas int    `json:"replicas"`
+	Status   string     `json:"status,omitempty"` // connected | unreachable | pending
+	Error    string     `json:"error,omitempty"`
+	Docker   string     `json:"docker_version,omitempty"`
+	Version  string     `json:"version,omitempty"` // saba version of the agent
+	Hostname string     `json:"hostname,omitempty"`
+	Platform string     `json:"platform,omitempty"` // os/arch
+	LastSeen time.Time  `json:"last_seen,omitzero"`
+	Stats    *HostStats `json:"stats,omitempty"`
+	Replicas int        `json:"replicas"`
+}
+
+// NodeAddRequest registers a node (or updates it, or issues a new join code).
+type NodeAddRequest struct {
+	Name           string `json:"name"`
+	SSH            string `json:"ssh,omitempty"`
+	Address        string `json:"address,omitempty"`
+	PrimaryAddress string `json:"primary_address,omitempty"`
+	// Rejoin issues a new join code and forgets the node's pinned key, for a
+	// reinstalled machine.
+	Rejoin bool `json:"rejoin,omitempty"`
+}
+
+type NodeAddResponse struct {
+	Node Node `json:"node"`
+	// Join is the one-time join code, when the node has to (re)join.
+	Join        string    `json:"join,omitempty"`
+	JoinExpires time.Time `json:"join_expires,omitzero"`
+}
+
+// HostStats is a snapshot of a server's resources.
+type HostStats struct {
+	CPUs      int     `json:"cpus"`
+	Load1     float64 `json:"load1"`
+	MemTotal  uint64  `json:"mem_total"`
+	MemUsed   uint64  `json:"mem_used"`
+	DiskTotal uint64  `json:"disk_total"`
+	DiskUsed  uint64  `json:"disk_used"`
 }
 
 type ServerInfo struct {

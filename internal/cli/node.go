@@ -1,17 +1,17 @@
 package cli
 
 import (
-	"bytes"
+	"context"
 	"fmt"
-	"os/exec"
+	"os"
 	"strconv"
-	"strings"
 	"time"
 
 	"github.com/spf13/cobra"
 
 	"github.com/egoist/saba/internal/api"
 	"github.com/egoist/saba/internal/client"
+	"github.com/egoist/saba/internal/cluster"
 	"github.com/egoist/saba/internal/shellwords"
 )
 
@@ -22,11 +22,11 @@ func (c *CLI) nodeCmd() *cobra.Command {
 		Short:   "Add servers to scale apps across machines",
 		Long: `Spread an app's replicas across several servers.
 
-The server running the saba daemon is the primary (node "local"). Additional
-nodes need only Docker and SSH access from the primary: no saba install and no
-open ports. The primary drives each node's Docker engine and reaches its
-replicas through one persistent SSH connection, so traffic between servers is
-encrypted. The primary keeps terminating HTTPS and load-balances all replicas.
+The server running the saba daemon is the primary (node "local"). Every other
+node runs the saba agent, which connects out to the primary over TLS. That one
+encrypted connection carries everything: Docker control and the traffic to the
+node's replicas. Nodes need Docker and no open ports, so they can sit behind
+NAT; the primary only needs its HTTPS port reachable from them.
 
 Place an app with "nodes" in saba.toml or --node on deploy:
 
@@ -38,7 +38,8 @@ Good to know:
   - Containers reach each other by name only on the same server. An app that
     publishes a port (publish = ["10.0.0.1:5432:5432"]) is also reachable by
     name from other nodes, at its server's address (--address).`,
-		Example: `  saba node add worker1 root@10.0.0.2
+		Example: `  saba node add worker1 root@203.0.113.20     # install the agent over SSH
+  saba node add homelab                       # print a join command to run on the node
   saba node list
   saba deploy -a web --node local --node worker1 --replicas 4
   saba node remove worker1 --yes`,
@@ -50,76 +51,53 @@ Good to know:
 		RunE: func(cmd *cobra.Command, args []string) error { return c.nodeList(cmd) },
 	}
 
-	var (
-		address     string
-		noAuthorize bool
-		direct      bool
-	)
+	var f nodeAddFlags
 	add := &cobra.Command{
-		Use:   "add <name> <user@host>",
+		Use:   "add <name> [user@host]",
 		Short: "Add a server to the cluster",
-		Long: `Register a server as a node. Two things happen:
+		Long: `Add a server as a node. With an SSH destination, saba installs everything:
+it connects to the server, checks Docker (installing it with
+--install-docker), installs the saba binary and the agent service, and waits
+for the agent to connect.
 
-  1. From this machine, saba logs in to the node over SSH, authorizes the
-     primary's public key there and reads the node's host keys (so the primary
-     can verify it is talking to the same machine).
-  2. The primary connects to the node and checks its Docker engine.
+Without a destination, saba prints a join command to run on the server
+yourself. Use that for machines you cannot reach over SSH from here, such as a
+home server behind NAT. The join code works once and expires after 24 hours.
 
-<user@host> must be reachable from the primary. If this machine cannot reach
-the node (e.g. it only has a private address), use --no-authorize and add the
-key printed by "saba node key" to the node's ~/.ssh/authorized_keys yourself.
+The agent connects to the primary at --primary-address, by default the
+primary's "address" setting or its public IP, on its HTTPS port (443).
 
-Traffic to the node's replicas goes through the SSH connection by default:
-encrypted, and nothing to configure. When the servers share a private network,
---direct --address <private-ip> makes the primary connect to replicas straight
-over that network instead, which is faster. Replica ports are then open on
-that address, unencrypted, so only use it on a network you trust. Run the
-command again to change a node's settings; apps pick them up on their next
-deploy or restart.`,
-		Example: "  saba node add worker1 root@203.0.113.20\n  saba node add worker1 root@10.0.0.2 --address 10.0.0.2 --direct",
-		Args:    exactArgs(2),
+Running it again for a joined node updates its --address. --rejoin issues a new
+join code for a reinstalled machine.`,
+		Example: `  saba node add worker1 root@203.0.113.20
+  saba node add worker1 deploy@10.0.0.2 --address 10.0.0.2 --primary-address 10.0.0.1
+  saba node add homelab
+  saba node add worker1 root@203.0.113.20 --rejoin`,
+		Args: cobra.RangeArgs(1, 2),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			name, target := args[0], args[1]
-			if err := api.ValidateName(name); err != nil {
-				return err
+			target := ""
+			if len(args) == 2 {
+				target = args[1]
 			}
-			cl, err := c.api()
-			if err != nil {
-				return err
-			}
-			node := api.Node{Name: name, SSH: target, Address: address, Direct: direct}
-			if !noAuthorize {
-				key, err := cl.NodeKey(cmd.Context())
-				if err != nil {
-					return err
-				}
-				hostKeys, err := authorizeNode(cmd, target, key)
-				if err != nil {
-					return err
-				}
-				node.HostKeys = hostKeys
-			}
-			added, err := cl.NodeAdd(cmd.Context(), node)
-			if err != nil {
-				return err
-			}
-			return c.result(added, func() {
-				mode := "traffic goes through the SSH tunnel"
-				if added.Direct {
-					mode = "traffic goes directly to " + added.Address
-				}
-				c.ui.success("Node %s added (Docker %s, %s)", c.ui.bold(name), added.Docker, mode)
-				c.ui.note("Run replicas on it with `saba deploy -a <app> --node local --node %s --replicas 2`.", name)
-			})
+			return c.nodeAdd(cmd.Context(), args[0], target, &f)
 		},
 	}
-	add.Flags().StringVar(&address, "address", "", "The node's address on the network shared with the other servers (for cross-node access to published ports)")
-	add.Flags().BoolVar(&direct, "direct", false, "Send replica traffic straight to --address over a private network instead of through the SSH tunnel (faster, unencrypted)")
-	add.Flags().BoolVar(&noAuthorize, "no-authorize", false, "Do not log in to the node from this machine; the primary's key is already authorized there")
+	fl := add.Flags()
+	fl.StringVar(&f.address, "address", "", "The node's IP on the network shared with the other servers (for cross-node access to published ports)")
+	fl.StringVar(&f.primary, "primary-address", "", "Address the node uses to reach the primary (default: the primary's address setting, or its public IP)")
+	fl.BoolVar(&f.rejoin, "rejoin", false, "Issue a new join code and forget the node's previous key")
+	fl.BoolVar(&f.installDocker, "install-docker", false, "Install Docker on the node if it is missing")
+	fl.StringVar(&f.binary, "binary", "", "Upload this local Linux binary instead of downloading a release (for unreleased builds)")
 
-	var yes bool
+	var (
+		yes       bool
+		keepAgent bool
+	)
 	remove := &cobra.Command{
 		Use: "remove <name>", Aliases: []string{"rm"}, Short: "Remove a server from the cluster", Args: exactArgs(1),
+		Long: `Remove a node. It refuses while apps are placed on the node. When the agent
+was installed over SSH, it is uninstalled the same way unless --keep-agent is
+given. Containers, images and volumes on the node are not touched.`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if err := c.confirm(yes, "Removing node "+args[0], "saba node remove "+args[0]); err != nil {
 				return err
@@ -128,30 +106,158 @@ deploy or restart.`,
 			if err != nil {
 				return err
 			}
+			var node *api.Node
+			if nodes, err := cl.Nodes(cmd.Context()); err == nil {
+				for i := range nodes {
+					if nodes[i].Name == args[0] {
+						node = &nodes[i]
+					}
+				}
+			}
 			if err := cl.NodeRemove(cmd.Context(), args[0]); err != nil {
 				return err
 			}
-			return c.result(map[string]any{"node": args[0], "removed": true}, func() { c.ui.success("Node %s removed", args[0]) })
+			uninstalled := false
+			if node != nil && node.SSH != "" && !keepAgent {
+				host := c.newRemote(cmd.Context(), node.SSH, "node")
+				if err := host.probe(); err == nil {
+					_, err = host.run(host.sudo+"/usr/local/bin/saba agent uninstall", nil, false)
+					uninstalled = err == nil
+				}
+			}
+			return c.result(map[string]any{"node": args[0], "removed": true, "agent_uninstalled": uninstalled}, func() {
+				c.ui.success("Node %s removed", args[0])
+				if !uninstalled {
+					c.ui.note("The agent on the node now gets refused. Uninstall it there with `sudo saba agent uninstall`.")
+				}
+			})
 		},
 	}
 	remove.Flags().BoolVarP(&yes, "yes", "y", false, "Confirm the removal")
-
-	key := &cobra.Command{
-		Use: "key", Short: "Print the primary's public key (to authorize on nodes by hand)", Args: maxArgs(0),
-		RunE: func(cmd *cobra.Command, args []string) error {
-			cl, err := c.api()
-			if err != nil {
-				return err
-			}
-			k, err := cl.NodeKey(cmd.Context())
-			if err != nil {
-				return err
-			}
-			return c.result(map[string]string{"public_key": k}, func() { fmt.Fprintln(c.stdout, k) })
-		},
-	}
-	cmd.AddCommand(list, add, remove, key)
+	remove.Flags().BoolVar(&keepAgent, "keep-agent", false, "Do not uninstall the agent from the node")
+	cmd.AddCommand(list, add, remove)
 	return cmd
+}
+
+type nodeAddFlags struct {
+	address, primary, binary string
+	rejoin, installDocker    bool
+}
+
+type nodeAddResult struct {
+	api.NodeAddResponse
+	// Instructions is set when the agent must be installed by hand.
+	Instructions []string `json:"instructions,omitempty"`
+}
+
+func (c *CLI) nodeAdd(ctx context.Context, name, target string, f *nodeAddFlags) error {
+	if err := api.ValidateName(name); err != nil {
+		return err
+	}
+	tag, err := releaseTag("", Version)
+	if err != nil {
+		return err
+	}
+	if f.binary != "" {
+		if _, err := os.Stat(f.binary); err != nil {
+			return api.Errorf(api.CodeInvalid, "cannot read binary %s: %v", f.binary, err)
+		}
+	}
+	cl, err := c.api()
+	if err != nil {
+		return err
+	}
+	resp, err := cl.NodeAdd(ctx, api.NodeAddRequest{Name: name, SSH: target, Address: f.address, PrimaryAddress: f.primary, Rejoin: f.rejoin})
+	if err != nil {
+		return err
+	}
+	res := nodeAddResult{NodeAddResponse: *resp}
+	if resp.Join == "" {
+		return c.result(res, func() {
+			c.ui.success("Node %s updated", c.ui.bold(name))
+			c.ui.note("It already joined. To join a reinstalled machine, run this again with --rejoin.")
+		})
+	}
+
+	if target == "" {
+		// As root, install.sh puts the binary in /usr/local/bin.
+		install := "curl -fsSL https://raw.githubusercontent.com/egoist/saba/main/install.sh | sudo sh"
+		if tag != "" {
+			install = "curl -fsSL https://raw.githubusercontent.com/egoist/saba/main/install.sh | sudo SABA_VERSION=" + tag + " sh"
+		}
+		res.Instructions = []string{install, "sudo saba agent install --join " + resp.Join}
+		return c.result(res, func() {
+			c.ui.success("Node %s is waiting to join", c.ui.bold(name))
+			c.ui.printf("\nOn the node, run:\n\n")
+			for _, line := range res.Instructions {
+				c.ui.printf("  %s\n", line)
+			}
+			c.ui.printf("\n")
+			c.ui.note("The join code works once and expires %s. Check progress with `saba node list`.", resp.JoinExpires.Local().Format("Jan 2 15:04"))
+		})
+	}
+
+	host := c.newRemote(ctx, target, "node")
+	if err := host.probe(); err != nil {
+		return err
+	}
+	if err := host.ensureDocker(f.installDocker); err != nil {
+		return err
+	}
+	if err := host.installBinary(f.binary, tag); err != nil {
+		return err
+	}
+	host.step("Installing the agent")
+	if _, err := host.run(host.sudo+shellwords.Join([]string{"/usr/local/bin/saba", "agent", "install", "--join", resp.Join}), nil, true); err != nil {
+		return api.Errorf(api.CodeRuntime, "installing the agent failed: %v", err).
+			WithHint("Inspect it on the node: `journalctl -u saba-agent -n 50`.")
+	}
+	host.step("Waiting for the agent to connect")
+	node, err := waitForNode(ctx, cl, name, 45*time.Second)
+	if err != nil {
+		return api.Errorf(api.CodeUnreachable, "the agent on %s did not connect: %v", target, err).
+			WithHint("On the node, `journalctl -u saba-agent -n 50` says why. It must reach the primary at %s.", primaryOf(resp.Join))
+	}
+	res.Node = *node
+	res.Join = "" // spent
+	return c.result(res, func() {
+		c.ui.success("Node %s joined (saba %s, Docker %s)", c.ui.bold(name), node.Version, node.Docker)
+		c.ui.note("Run replicas on it with `saba deploy -a <app> --node local --node %s --replicas 2`.", name)
+	})
+}
+
+func primaryOf(join string) string {
+	if j, err := cluster.ParseJoin(join); err == nil {
+		return j.Primary
+	}
+	return "its configured address"
+}
+
+func waitForNode(ctx context.Context, cl *client.Client, name string, timeout time.Duration) (*api.Node, error) {
+	deadline := time.Now().Add(timeout)
+	last := "not connected yet"
+	for time.Now().Before(deadline) {
+		nodes, err := cl.Nodes(ctx)
+		if err != nil {
+			return nil, err
+		}
+		for i := range nodes {
+			if nodes[i].Name == name {
+				if nodes[i].Status == "connected" {
+					return &nodes[i], nil
+				}
+				if nodes[i].Error != "" {
+					last = nodes[i].Error
+				}
+			}
+		}
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(time.Second):
+		}
+	}
+	return nil, fmt.Errorf("%s", last)
 }
 
 func (c *CLI) nodeList(cmd *cobra.Command) error {
@@ -166,65 +272,33 @@ func (c *CLI) nodeList(cmd *cobra.Command) error {
 	return c.result(nodes, func() {
 		rows := make([][]string, 0, len(nodes))
 		for _, n := range nodes {
-			target := n.SSH
-			if n.Name == api.LocalNode {
-				target = "(primary)"
-			}
-			status := c.ui.status(n.Status)
-			if n.Status == "connected" {
+			status := c.ui.red(n.Status)
+			switch n.Status {
+			case "connected":
 				status = c.ui.green(n.Status)
-			} else {
-				status = c.ui.red(n.Status)
+			case "pending":
+				status = c.ui.yellow(n.Status)
 			}
-			traffic := "ssh tunnel"
-			switch {
-			case n.Name == api.LocalNode:
-				traffic = "-"
-			case n.Direct:
-				traffic = "direct"
+			load, mem, disk := "-", "-", "-"
+			if s := n.Stats; s != nil {
+				load = strconv.FormatFloat(s.Load1, 'f', 2, 64) + "/" + strconv.Itoa(s.CPUs)
+				if s.MemTotal > 0 {
+					mem = fmt.Sprintf("%d%% of %s", s.MemUsed*100/s.MemTotal, humanBytes(int64(s.MemTotal)))
+				}
+				if s.DiskTotal > 0 {
+					disk = fmt.Sprintf("%d%% of %s", s.DiskUsed*100/s.DiskTotal, humanBytes(int64(s.DiskTotal)))
+				}
 			}
-			rows = append(rows, []string{n.Name, status, target, orDash(n.Address), traffic, orDash(n.Docker), strconv.Itoa(n.Replicas)})
+			rows = append(rows, []string{n.Name, status, orDash(n.Address), orDash(n.Version), orDash(n.Docker), load, mem, disk, strconv.Itoa(n.Replicas)})
 		}
-		c.ui.table([]string{"NAME", "STATUS", "SSH", "ADDRESS", "TRAFFIC", "DOCKER", "REPLICAS"}, rows)
+		c.ui.table([]string{"NAME", "STATUS", "ADDRESS", "SABA", "DOCKER", "LOAD", "MEMORY", "DISK", "REPLICAS"}, rows)
 		for _, n := range nodes {
-			if n.Error != "" {
+			switch {
+			case n.Status == "pending":
+				c.ui.printf("%s %s has not joined yet; `saba node add %s --rejoin` prints a new join command.\n", c.ui.yellow("!"), n.Name, n.Name)
+			case n.Error != "":
 				c.ui.printf("%s %s: %s\n", c.ui.red("!"), n.Name, n.Error)
 			}
 		}
 	})
-}
-
-// authorizeNode logs in to a node from this machine, appends the primary's
-// public key to authorized_keys and returns the node's SSH host keys.
-func authorizeNode(cmd *cobra.Command, target, key string) ([]string, error) {
-	k := shellwords.Quote(key)
-	script := strings.Join([]string{
-		"set -e",
-		"mkdir -p ~/.ssh && chmod 700 ~/.ssh",
-		"touch ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys",
-		"grep -qxF " + k + " ~/.ssh/authorized_keys || echo " + k + " >> ~/.ssh/authorized_keys",
-		"command -v docker >/dev/null 2>&1 || echo SABA_NO_DOCKER",
-		"cat /etc/ssh/ssh_host_*_key.pub 2>/dev/null || true",
-	}, "; ")
-	argv := client.SSHCommand(target, false, script)
-	proc := exec.CommandContext(cmd.Context(), argv[0], argv[1:]...)
-	var out, errb bytes.Buffer
-	proc.Stdout, proc.Stderr = &out, &errb
-	proc.WaitDelay = 2 * time.Second
-	if err := proc.Run(); err != nil && err != exec.ErrWaitDelay {
-		return nil, api.Errorf(api.CodeUnreachable, "cannot log in to %s from this machine: %s", target, lastLine(orDash(strings.TrimSpace(errb.String())))).
-			WithHint("If only the primary can reach the node, authorize the key from `saba node key` in the node's ~/.ssh/authorized_keys and re-run with --no-authorize.")
-	}
-	var hostKeys []string
-	for _, line := range strings.Split(out.String(), "\n") {
-		f := strings.Fields(line)
-		switch {
-		case strings.TrimSpace(line) == "SABA_NO_DOCKER":
-			return nil, api.Errorf(api.CodeInvalid, "Docker is not installed on %s", target).
-				WithHint("Install it on the node first: `ssh %s 'curl -fsSL https://get.docker.com | sh'`.", target)
-		case len(f) >= 2 && (strings.HasPrefix(f[0], "ssh-") || strings.HasPrefix(f[0], "ecdsa-")):
-			hostKeys = append(hostKeys, f[0]+" "+f[1])
-		}
-	}
-	return hostKeys, nil
 }

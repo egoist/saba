@@ -2,6 +2,7 @@ package cli
 
 import (
 	"compress/gzip"
+	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
@@ -9,7 +10,9 @@ import (
 	"crypto/x509/pkix"
 	"encoding/pem"
 	"fmt"
+	"github.com/egoist/saba/internal/cluster"
 	"io"
+	"log/slog"
 	"math/big"
 	"net/http"
 	"net/http/httptest"
@@ -124,13 +127,10 @@ func TestNodesCertsAndSecretsThroughTheCLI(t *testing.T) {
 	if code != 0 || len(nodes) != 1 || nodes[0].Name != api.LocalNode || nodes[0].Status != "connected" {
 		t.Fatalf("node list: %s", out)
 	}
-	if code, out, _ = saba("node", "key", "--json"); code != 0 || !strings.Contains(out, "ssh-ed25519 ") {
-		t.Fatalf("node key: %d %s", code, out)
-	}
 	if code, _, errOut := saba("deploy", "-a", "web", "--image", "ok:1", "--node", "ghost", "--json"); code != api.ExitNotFound || !strings.Contains(errOut, "saba node add") {
 		t.Fatalf("deploying to an unknown node: %d %s", code, errOut)
 	}
-	if code, _, _ = saba("node", "add", "local", "root@example.test", "--no-authorize", "--json"); code != api.ExitUsage {
+	if code, _, _ = saba("node", "add", "local", "--primary-address", "127.0.0.1:1", "--json"); code != api.ExitUsage {
 		t.Fatalf("the name local is reserved, exit %d", code)
 	}
 	if code, _, _ = saba("node", "remove", "ghost", "--yes", "--json"); code != api.ExitNotFound {
@@ -336,17 +336,113 @@ func TestBackupsToS3ThroughTheCLI(t *testing.T) {
 	}
 }
 
-func TestDirectNodeValidation(t *testing.T) {
-	startDaemon(t)
-	for name, args := range map[string][]string{
-		"no address":     {"node", "add", "w1", "root@198.51.100.7", "--direct", "--no-authorize"},
-		"public address": {"node", "add", "w1", "root@198.51.100.7", "--direct", "--address", "198.51.100.7", "--no-authorize"},
-		"not an address": {"node", "add", "w1", "root@198.51.100.7", "--direct", "--address", "node.internal", "--no-authorize"},
-	} {
-		code, _, errOut := saba(append(args, "--json")...)
-		if code != api.ExitUsage || errorCode(t, errOut) != api.CodeInvalid {
-			t.Errorf("%s: exit %d %s", name, code, errOut)
+// The full join flow, with the real daemon and a real agent in-process.
+func TestNodeJoinThroughTheCLI(t *testing.T) {
+	clusterAddr := startDaemon(t)
+
+	// Without an SSH destination, node add prints how to install the agent.
+	code, out, errOut := saba("node", "add", "w1", "--primary-address", clusterAddr, "--address", "10.0.0.2", "--json")
+	var res nodeAddResult
+	mustJSON(t, out, &res)
+	if code != 0 || res.Join == "" || len(res.Instructions) != 2 || !strings.Contains(res.Instructions[1], "saba agent install --join saba-join-") {
+		t.Fatalf("node add: %d %s %s", code, out, errOut)
+	}
+	j, err := cluster.ParseJoin(res.Join)
+	if err != nil || j.Primary != clusterAddr || j.Node != "w1" {
+		t.Fatalf("join code: %+v %v", j, err)
+	}
+	nodeStatus := func(name string) api.Node {
+		t.Helper()
+		_, out, _ := saba("node", "list", "--json")
+		var nodes []api.Node
+		mustJSON(t, out, &nodes)
+		for _, n := range nodes {
+			if n.Name == name {
+				if n.TokenHash != "" {
+					t.Fatal("node list must not expose the token hash")
+				}
+				return n
+			}
 		}
+		return api.Node{}
+	}
+	if n := nodeStatus("w1"); n.Status != "pending" || n.Address != "10.0.0.2" {
+		t.Fatalf("before joining: %+v", n)
+	}
+	if code, out, _ = saba("doctor", "--json"); code == 0 || !strings.Contains(out, "Waiting for the agent to join") {
+		t.Fatalf("doctor should report the pending node: %s", out)
+	}
+
+	// The agent joins with the code and shows up connected, with stats.
+	runAgent := func(code string) (context.CancelFunc, chan error) {
+		dir, _ := os.MkdirTemp("", "ag")
+		t.Cleanup(func() { os.RemoveAll(dir) })
+		jj, _ := cluster.ParseJoin(code)
+		cfg := filepath.Join(dir, "agent.json")
+		cluster.ConfigFromJoin(jj).Save(cfg)
+		ctx, cancel := context.WithCancel(context.Background())
+		a := &cluster.Agent{ConfigPath: cfg, DataDir: filepath.Join(dir, "data"), Version: "test",
+			Log: slog.New(slog.NewTextHandler(io.Discard, nil)), HeartbeatInterval: 50 * time.Millisecond,
+			DockerVersion: func(context.Context) string { return "27.1.0" }}
+		done := make(chan error, 1)
+		go func() { done <- a.Run(ctx) }()
+		t.Cleanup(cancel)
+		return cancel, done
+	}
+	stop, _ := runAgent(res.Join)
+	waitStatus := func(name, want string) api.Node {
+		t.Helper()
+		deadline := time.Now().Add(5 * time.Second)
+		for time.Now().Before(deadline) {
+			if n := nodeStatus(name); n.Status == want && (want != "connected" || n.Stats != nil) {
+				return n
+			}
+			time.Sleep(30 * time.Millisecond)
+		}
+		t.Fatalf("%s never became %s: %+v", name, want, nodeStatus(name))
+		return api.Node{}
+	}
+	n := waitStatus("w1", "connected")
+	if n.Version != "test" || n.Docker != "27.1.0" || n.Stats.CPUs == 0 || n.KeyFingerprint == "" || n.JoinedAt.IsZero() {
+		t.Fatalf("connected node: %+v", n)
+	}
+	if code, out, _ = saba("doctor", "--json"); !strings.Contains(out, "node:w1") || !strings.Contains(out, "Connected") {
+		t.Fatalf("doctor: %d %s", code, out)
+	}
+
+	// Adding a joined node again only updates it; it does not hand out a code.
+	code, out, _ = saba("node", "add", "w1", "--address", "10.0.0.3", "--json")
+	res = nodeAddResult{}
+	mustJSON(t, out, &res)
+	if code != 0 || res.Join != "" || res.Node.Address != "10.0.0.3" {
+		t.Fatalf("re-adding a joined node: %s", out)
+	}
+
+	// The agent reconnects by itself, with its pinned key.
+	stop()
+	waitStatus("w1", "unreachable")
+	runAgent(j.String()) // the same config again; the spent token is ignored, the key is new
+	time.Sleep(400 * time.Millisecond)
+	if n := nodeStatus("w1"); n.Status == "connected" {
+		t.Fatal("an agent with a different key must not take over a joined node")
+	}
+
+	// --rejoin issues a new code for a reinstalled machine.
+	code, out, _ = saba("node", "add", "w1", "--rejoin", "--primary-address", clusterAddr, "--json")
+	res = nodeAddResult{}
+	mustJSON(t, out, &res)
+	if code != 0 || res.Join == "" {
+		t.Fatalf("rejoin: %s", out)
+	}
+	runAgent(res.Join)
+	waitStatus("w1", "connected")
+
+	// Removing the node refuses it from then on.
+	if code, _, errOut = saba("node", "remove", "w1", "--yes", "--json"); code != 0 {
+		t.Fatalf("remove: %s", errOut)
+	}
+	if n := nodeStatus("w1"); n.Name != "" {
+		t.Fatalf("removed node still listed: %+v", n)
 	}
 }
 

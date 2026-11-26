@@ -20,7 +20,7 @@ binary that acts as both the server daemon and the CLI you drive it with, over p
 | [Environment variables](environment.md) | Secrets, references between apps, variables saba injects |
 | [Domains and HTTPS](domains-and-https.md) | Automatic domains, custom domains, certificates, wildcards, your own certificates |
 | [Databases and backups](databases.md) | Managed Postgres/MySQL/MariaDB/Redis/MongoDB, backups, S3 mirroring, disaster recovery |
-| [Scaling](scaling.md) | Replicas, adding servers, placement, tunnel and direct traffic, failure behavior |
+| [Scaling](scaling.md) | Replicas, adding servers with the agent, placement, failure behavior |
 | [Operating apps](operations.md) | Status, logs, exec, one-off commands, cron, stop/start, destroy, diagnostics |
 | [Servers](servers.md) | Server setup and upgrades, contexts, SSH, the daemon and systemd, files on disk |
 | [Automation and AI agents](automation.md) | JSON output, exit and error codes, CI/CD, the MCP server |

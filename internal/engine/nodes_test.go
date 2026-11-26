@@ -2,11 +2,14 @@ package engine
 
 import (
 	"context"
+	"errors"
+	"net"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/egoist/saba/internal/api"
 	"github.com/egoist/saba/internal/runtime"
@@ -17,9 +20,10 @@ import (
 // fakeNodes is a cluster of in-process runtimes. Their containers listen on
 // the local loopback already, so a "tunnel" only needs to be recorded.
 type fakeNodes struct {
-	mu       sync.Mutex
-	rts      map[string]*runtimetest.Fake
-	forwards map[string]bool
+	mu    sync.Mutex
+	rts   map[string]*runtimetest.Fake
+	dials map[string]int  // node → connections made through its "agent"
+	down  map[string]bool // nodes whose agent is disconnected
 }
 
 func (f *fakeNodes) Runtime(node string) runtime.Runtime {
@@ -31,32 +35,37 @@ func (f *fakeNodes) Runtime(node string) runtime.Runtime {
 	return f.rts[node]
 }
 
-func (f *fakeNodes) key(node string, port int) string { return node + ":" + strconv.Itoa(port) }
+// Dial stands in for the agent: the fake runtime's containers listen on this
+// machine's loopback, whichever "node" they belong to.
+func (f *fakeNodes) Dial(ctx context.Context, node string, port int) (net.Conn, error) {
+	f.mu.Lock()
+	down := f.down[node]
+	f.dials[node]++
+	f.mu.Unlock()
+	if down {
+		return nil, &net.OpError{Op: "dial", Net: "tcp", Err: errors.New("node " + node + " is not connected")}
+	}
+	var d net.Dialer
+	return d.DialContext(ctx, "tcp", "127.0.0.1:"+strconv.Itoa(port))
+}
+
+func (f *fakeNodes) dialed(node string) int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.dials[node]
+}
+
+func (f *fakeNodes) setDown(node string, down bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.down[node] = down
+}
 
 func itoa(n int) string { return strconv.Itoa(n) }
 
-func (f *fakeNodes) Forward(_ context.Context, node string, port int) error {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.forwards[f.key(node, port)] = true
-	return nil
-}
-
-func (f *fakeNodes) Unforward(_ context.Context, node string, port int) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	delete(f.forwards, f.key(node, port))
-}
-
-func (f *fakeNodes) open() int {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	return len(f.forwards)
-}
-
 func withNodes(t *testing.T, h *harness, names ...string) *fakeNodes {
 	t.Helper()
-	fn := &fakeNodes{rts: map[string]*runtimetest.Fake{}, forwards: map[string]bool{}}
+	fn := &fakeNodes{rts: map[string]*runtimetest.Fake{}, dials: map[string]int{}, down: map[string]bool{}}
 	h.engine.Nodes = fn
 	if err := h.engine.Store.Update(func(st *store.State) error {
 		st.Nodes = map[string]*api.Node{}
@@ -101,13 +110,14 @@ func TestReplicasAreSpreadAcrossNodes(t *testing.T) {
 	if w1.Loads != 1 || !w1.HasImage(imageTag("web", 1)) {
 		t.Fatalf("the image should have been shipped to w1 exactly once (loads: %d)", w1.Loads)
 	}
-	if nodes.open() != 2 {
-		t.Fatalf("each remote replica needs a tunnel, have %d", nodes.open())
-	}
+	before := nodes.dialed("w1")
 	for i := 0; i < 8; i++ {
 		if code, body := h.get("web.test", "/"); code != 200 || body != "ok v1" {
 			t.Fatalf("request %d: %d %q", i, code, body)
 		}
+	}
+	if nodes.dialed("w1") == before {
+		t.Fatal("requests to replicas on w1 must go through its agent")
 	}
 
 	// Status shows which server each container runs on.
@@ -130,9 +140,6 @@ func TestReplicasAreSpreadAcrossNodes(t *testing.T) {
 	if strings.Join(names, ",") != "saba-web-v2-1,saba-web-v2-2,saba-web-v2-3,saba-web-v2-4" {
 		t.Fatalf("after the rollout: %v", names)
 	}
-	if nodes.open() != 2 {
-		t.Fatalf("tunnels of the old version must be closed, have %d", nodes.open())
-	}
 
 	// Moving the app entirely to the worker.
 	move := api.DeployRequest{Source: api.Source{Type: "current"}, Config: map[string]any{"nodes": []any{"w1"}, "replicas": 2}}
@@ -153,8 +160,8 @@ func TestReplicasAreSpreadAcrossNodes(t *testing.T) {
 	if _, err := h.engine.Destroy(ctx, "web", true); err != nil {
 		t.Fatal(err)
 	}
-	if len(w1.Names()) != 0 || nodes.open() != 0 || w1.HasImage(imageTag("web", 1)) {
-		t.Fatalf("destroy left things on w1: containers %v, tunnels %d", w1.Names(), nodes.open())
+	if len(w1.Names()) != 0 || w1.HasImage(imageTag("web", 1)) {
+		t.Fatalf("destroy left things on w1: containers %v", w1.Names())
 	}
 }
 
@@ -231,46 +238,26 @@ func TestCrossNodeNameResolution(t *testing.T) {
 	}
 }
 
-// In direct mode the primary reaches replicas on the node's private address;
-// no tunnel is opened.
-func TestDirectNodeBypassesTheTunnel(t *testing.T) {
+// When a node's agent is disconnected, requests go to the replicas elsewhere.
+func TestDisconnectedNodeFailsOver(t *testing.T) {
 	h := newHarness(t)
 	nodes := withNodes(t, h, "w1")
-	if err := h.engine.Store.Update(func(st *store.State) error {
-		st.Nodes["w1"].Address, st.Nodes["w1"].Direct = "127.0.0.2", true
-		return nil
-	}); err != nil {
-		t.Fatal(err)
-	}
 	req := image("ok:1")
-	req.Config = map[string]any{"replicas": 4, "nodes": []any{"local", "w1"}}
-	res := h.mustDeploy("web", req)
-	for _, r := range res.Deployment.Replicas {
-		wantAddr := ""
-		if r.Node == "w1" {
-			wantAddr = "127.0.0.2"
-		}
-		if r.Addr != wantAddr {
-			t.Fatalf("replica %d on %q is published on %q, want %q", r.Index, r.Node, r.Addr, wantAddr)
-		}
-	}
-	if nodes.open() != 0 {
-		t.Fatalf("direct mode must not open tunnels, have %d", nodes.open())
-	}
-	for i := 0; i < 8; i++ {
+	req.Config = map[string]any{"replicas": 2, "nodes": []any{"local", "w1"}}
+	h.mustDeploy("web", req)
+	nodes.setDown("w1", true)
+	for i := 0; i < 10; i++ {
 		if code, body := h.get("web.test", "/"); code != 200 || body != "ok v1" {
-			t.Fatalf("request %d: %d %q", i, code, body)
+			t.Fatalf("request %d with w1 down: %d %q", i, code, body)
 		}
 	}
-	// Switching the node back to the tunnel takes effect on the next rollout.
-	if err := h.engine.Store.Update(func(st *store.State) error { st.Nodes["w1"].Direct = false; return nil }); err != nil {
-		t.Fatal(err)
+	nodes.setDown("w1", false)
+	before := nodes.dialed("w1")
+	time.Sleep(2100 * time.Millisecond) // the proxy skips a failed replica for 2s
+	for i := 0; i < 6; i++ {
+		h.get("web.test", "/")
 	}
-	h.mustDeploy("web", api.DeployRequest{Source: api.Source{Type: "current"}})
-	if nodes.open() != 2 {
-		t.Fatalf("after switching to tunnel mode each remote replica needs a tunnel, have %d", nodes.open())
-	}
-	if code, _ := h.get("web.test", "/"); code != 200 {
-		t.Fatalf("after switching modes: %d", code)
+	if nodes.dialed("w1") == before {
+		t.Fatal("w1 should be back in rotation once its agent reconnects")
 	}
 }

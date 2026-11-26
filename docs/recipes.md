@@ -196,15 +196,13 @@ default for everyone working on it; production then always needs `-c prod`.
 ## Scaling out to a second server
 
 ```sh
-saba node add worker1 root@10.0.0.2 --address 10.0.0.2 --direct
 saba server config set address 10.0.0.1
+saba node add worker1 root@10.0.0.2 --address 10.0.0.2
 saba db create main --engine postgres --publish 10.0.0.1:5432:5432
 saba deploy -a api --node local --node worker1 --replicas 4 -e DATABASE_URL='${{main.URL}}'
 ```
 
-`node add` logs in to the node from your machine to authorize the primary's key; if only the
-primary can reach `10.0.0.2`, see [adding servers](scaling.md#adding-servers) for
-`--no-authorize`.
+Setting the primary's `address` first makes the node's agent connect over the private network.
 
 The primary keeps the database and terminates HTTPS; `api` runs two replicas on each server.
 Publishing the database on the primary's private address lets the replicas on `worker1` reach it

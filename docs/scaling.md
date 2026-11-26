@@ -23,54 +23,96 @@ starve the others.
 ## Adding servers
 
 A saba cluster has one **primary**, the server running the saba daemon, and any number of
-**worker nodes**. The primary terminates all traffic, keeps all state and drives every node's
-Docker engine. Nodes run replicas.
+**worker nodes**. The primary terminates all traffic, keeps all state and decides what runs
+where. Each node runs the **saba agent**, which connects out to the primary and carries
+everything over that one connection: Docker control and the requests to the node's replicas.
 
 A node needs:
 
 - Linux with Docker,
-- SSH access from the primary as a user that can use Docker (root, or a member of the `docker`
-  group),
-- SSH forwarding enabled in its `sshd` (`AllowTcpForwarding` and `AllowStreamLocalForwarding`,
-  on by default in most distributions).
+- to be able to reach the primary on its HTTPS port (443), or on the cluster port (7443) when
+  the primary runs with `--tls off`.
 
-Nothing else: no saba install on the node and no open ports besides SSH.
+The node needs no open ports of its own and may sit behind NAT. Only the agent's outbound
+connection is required.
+
+### With SSH access to the node
 
 ```sh
-saba node add worker1 root@10.0.0.2
+saba node add worker1 root@203.0.113.20
 ```
 
 ```text
-✓ Node worker1 added (Docker 29.1.0, traffic goes through the SSH tunnel)
+▶ Connecting to root@203.0.113.20
+▶ Downloading saba v0.2.0 (linux/amd64) from GitHub
+▶ Installing the agent
+▶ Waiting for the agent to connect
+✓ Node worker1 joined (saba v0.2.0, Docker 29.1.0)
 ```
 
-What this does:
+saba connects over SSH as `server setup` does: it checks the machine (root or passwordless
+`sudo`), installs Docker if missing and you passed `--install-docker`, installs the same saba
+version as the primary, and installs the agent as the `saba-agent` systemd service. SSH is only
+used for the install; afterwards the agent's own connection is all the cluster uses.
 
-1. **From your machine**, saba logs in to the node over SSH, adds the primary's public key to the
-   node's `~/.ssh/authorized_keys` and reads the node's SSH host keys.
-2. **From the primary**, saba connects to the node with that key, verifying the host keys it
-   read, and checks that Docker works there.
+### Without SSH access
 
-If your machine cannot reach the node, for example because it only has a private address the
-primary can reach, add the primary's key to the node's `~/.ssh/authorized_keys` by another route
-(the cloud console, or through the primary as a jump host) and skip step 1:
+For a machine you cannot reach from here, such as a home server behind NAT, leave out the
+destination:
 
 ```sh
-saba node key | ssh -J root@203.0.113.10 root@10.0.0.2 'cat >> ~/.ssh/authorized_keys'
-saba node add worker1 root@10.0.0.2 --no-authorize
+saba node add homelab
 ```
 
-Without step 1 the primary trusts the node's host key the first time it connects.
+```text
+✓ Node homelab is waiting to join
+
+On the node, run:
+
+  curl -fsSL https://raw.githubusercontent.com/egoist/saba/main/install.sh | sudo SABA_VERSION=v0.2.0 sh
+  sudo saba agent install --join saba-join-eyJu...
+```
+
+The join code works once and expires after 24 hours. Running `saba node add homelab` again
+while the node has not joined yet replaces the code.
+
+### How a node joins
+
+- The join code contains the primary's address, the fingerprint of the primary's key, the node's
+  name and a one-time token. The primary stores only a hash of the token.
+- On its first connection the agent presents the token together with a key pair it generated
+  for itself. The primary pins that key, and from then on accepts the node only with it. The
+  agent likewise only talks to a primary with the pinned key.
+- The agent connects to `--primary-address` when given, otherwise to the primary's
+  [`address` setting](servers.md#server-settings), otherwise to its public IP. Give a private
+  address when the servers share a network, so traffic stays on it:
+
+  ```sh
+  saba node add worker1 root@10.0.0.2 --primary-address 10.0.0.1
+  ```
+
+- After a reinstall, the node has a new key and is refused. Issue a new code with
+  `saba node add worker1 --rejoin` (plus the SSH destination to reinstall automatically).
 
 ```sh
 saba node list
 ```
 
 ```text
-NAME     STATUS     SSH            ADDRESS   TRAFFIC     DOCKER  REPLICAS
-local    connected  (primary)      -         -           29.1.0  3
-worker1  connected  root@10.0.0.2  10.0.0.2  ssh tunnel  29.1.0  2
+NAME     STATUS     ADDRESS   SABA    DOCKER  LOAD    MEMORY           DISK             REPLICAS
+local    connected  10.0.0.1  v0.2.0  29.1.0  0.42/4  31% of 7.8 GB    22% of 160.0 GB  3
+worker1  connected  10.0.0.2  v0.2.0  29.1.0  1.10/4  58% of 7.8 GB    40% of 160.0 GB  2
+homelab  pending    -         -       -       -       -                -                0
 ```
+
+Agents report their load, memory and disk every ten seconds.
+
+### Versions
+
+Agents run the same version as the primary. When an agent connects to a primary running another
+release, it downloads that release, verifies its checksum, replaces itself and restarts, so
+upgrading the primary with `saba server setup` upgrades every node too. `saba doctor` reports a
+node running another version. Development builds are never replaced automatically.
 
 ## Placing replicas
 
@@ -99,40 +141,21 @@ saba deploy --node worker1                                # move the app to work
 ### Images
 
 Images are built or pulled on the primary, then streamed to each node that needs them, straight
-from Docker to Docker over the SSH connection. Nothing is sent when the node already has the
+from Docker to Docker over the agent's connection. Nothing is sent when the node already has the
 image, which also makes restarts and rollbacks to a version the node has seen cheap. No registry
 is involved.
 
 ## Traffic between servers
 
-### Through the SSH tunnel (default)
+Replicas on a node publish their ports on the node's loopback interface. The primary reaches
+them through the agent: each request opens a stream on the agent's connection, and the agent
+connects it to the replica's port. The proxy treats remote replicas exactly like local ones,
+including failover and draining.
 
-Each replica on a node publishes its port on the node's loopback interface, and the primary's
-SSH connection forwards a matching local port to it. The proxy treats remote replicas exactly
-like local ones. Traffic between servers is encrypted, nothing is exposed on the node, and no
-private network or firewall rule is needed.
-
-The cost is throughput and latency: every request to a remote replica passes through SSH on
-both ends.
-
-### Directly over a private network
-
-When the servers share a private network (a cloud VPC, WireGuard, Tailscale), let the primary
-connect to the node's replicas directly:
-
-```sh
-saba node add worker1 root@10.0.0.2 --address 10.0.0.2 --direct
-```
-
-Replicas on `worker1` then publish their ports on `10.0.0.2`, and the proxy connects there.
-Docker is still driven over SSH. This is faster, and it is **unencrypted**: replica ports are
-open on that address to anything on the network. saba therefore only accepts private addresses
-(10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 100.64.0.0/10) for direct mode.
-
-Run `node add` again with or without `--direct` to change a node. Apps pick up the change on their
-next deploy or `saba restart`. If replicas fail their health check right after enabling direct
-mode, the error says so: the primary cannot reach the node's address on the replica ports, which
-usually means a firewall.
+That connection is TLS 1.3 between pinned keys. Nothing is exposed on the node, and no private
+network or firewall rule is needed besides the node reaching the primary. On loopback, a request
+through an agent costs about 14 µs more than a direct one. Between real servers, the network
+latency between them matters far more.
 
 ## Talking between apps on different servers
 
@@ -156,13 +179,14 @@ spans **one server**. Across servers:
 
 ## When a node fails
 
-- The primary notices within seconds. Connections to that node's replicas fail, and the proxy
-  retries those requests on replicas elsewhere. Requests that were in flight on the node at that
-  moment fail.
+- The primary notices within seconds, when the agent's connection drops. New requests go to
+  replicas elsewhere. Requests that were in flight on the node at that moment fail.
 - The app shows `degraded`; `saba node list` and `saba doctor` show the node as `unreachable`
   with the error.
-- The primary keeps trying to reconnect. When the node is back, its tunnels are restored and its
-  replicas, restarted by Docker, return to rotation without a deploy.
+- The agent keeps trying to reconnect. When it is back, the primary checks the node's
+  containers (starting live ones that should run, removing leftovers) and its replicas return to
+  rotation without a deploy.
+- When the primary restarts, agents reconnect within seconds by themselves.
 - Deploys that place replicas on an unreachable node fail before switching traffic, so the
   current version keeps serving. Deploy with a placement that leaves the node out if it stays
   down.
@@ -177,7 +201,10 @@ saba node remove worker1 --yes
 ```
 
 Removal refuses while an app is placed on the node or has replicas there. It disconnects the
-node and forgets its keys; containers and images on the node are not touched.
+node and forgets its key, so its agent is refused from then on. When the agent was installed over
+SSH, it is uninstalled the same way (`--keep-agent` skips that); otherwise run
+`sudo saba agent uninstall` on the node. Containers, images and volumes on the node are not
+touched.
 
 ## Limitations
 
