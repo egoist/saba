@@ -179,7 +179,7 @@ AI agents: run "saba guide" for a complete, compact reference.`,
 	add("deploy", c.initCmd(), c.deployCmd(), c.cancelCmd(), c.rollbackCmd(), c.deploymentsCmd())
 	add("observe", c.appsCmd(), c.statusCmd(), c.logsCmd(), c.statsCmd(), c.doctorCmd())
 	add("manage", c.envCmd(), c.domainsCmd(), c.scaleCmd(), c.restartCmd(), c.stopCmd(), c.startCmd(),
-		c.execCmd(), c.runCmd(), c.dbCmd(), c.cronCmd(), c.destroyCmd())
+		c.execCmd(), c.runCmd(), c.dbCmd(), c.backupCmd(), c.cronCmd(), c.destroyCmd())
 	add("server", c.serverCmd(), c.nodeCmd(), c.agentCmd(), c.certsCmd(), c.contextCmd())
 	add("more", c.guideCmd(), c.mcpCmd(), c.versionCmd())
 	root.AddCommand(c.daemonCmd(), c.dialStdioCmd())

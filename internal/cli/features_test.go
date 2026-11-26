@@ -117,6 +117,51 @@ func TestDatabaseBackupsThroughTheCLI(t *testing.T) {
 	}
 }
 
+func TestVolumeBackupsThroughTheCLI(t *testing.T) {
+	startDaemon(t)
+	if code, _, errOut := saba("deploy", "-a", "files", "--image", "ok:1", "--volume", "data:/data", "--json"); code != 0 {
+		t.Fatalf("deploy: %s", errOut)
+	}
+	code, out, errOut := saba("backup", "create", "-a", "files", "--stop", "--json")
+	var b api.Backup
+	mustJSON(t, out, &b)
+	if code != 0 || b.Method != api.BackupVolumes || len(b.Volumes) != 1 || b.Volumes[0] != "data" {
+		t.Fatalf("backup create: %d %s %s", code, out, errOut)
+	}
+	dir := t.TempDir()
+	code, out, _ = saba("backup", "download", "-a", "files", "-o", dir, "--json")
+	var dl map[string]string
+	mustJSON(t, out, &dl)
+	if code != 0 || !strings.HasSuffix(dl["file"], ".tar.gz") {
+		t.Fatalf("download: %d %s", code, out)
+	}
+	if code, out, errOut = saba("backup", "restore", "-a", "files", dl["file"], "--yes", "--json"); code != 0 || !strings.Contains(out, `"data"`) {
+		t.Fatalf("restore from the downloaded file: %d %s %s", code, out, errOut)
+	}
+	if code, out, _ = saba("backup", "restore", "-a", "files", "--backup", "latest", "--yes"); code != 0 || !strings.Contains(out, "restored from backup "+b.ID+" (data)") {
+		t.Fatalf("restore: %d %s", code, out)
+	}
+	if code, out, _ = saba("backup", "schedule", "-a", "files", "@daily", "--stop", "--json"); code != 0 || !strings.Contains(out, `"stop": true`) {
+		t.Fatalf("schedule: %d %s", code, out)
+	}
+	if _, out, _ = saba("backup", "schedule", "-a", "files"); !strings.Contains(out, "stopping it meanwhile") {
+		t.Fatalf("schedule show: %s", out)
+	}
+	if _, out, _ = saba("backup", "list", "-a", "files"); !strings.Contains(out, "volumes") {
+		t.Fatalf("list: %s", out)
+	}
+	// Redis has no dump tool; its data volume is archived instead.
+	saba("db", "create", "cache", "--engine", "redis", "--json")
+	if code, out, errOut = saba("db", "backup", "create", "cache", "--json"); code != 0 || !strings.Contains(out, `"method": "volumes"`) {
+		t.Fatalf("redis backup: %d %s %s", code, out, errOut)
+	}
+	// Without volumes there is nothing to back up, and the error says so.
+	saba("deploy", "-a", "plain", "--image", "ok:1", "--json")
+	if code, _, errOut = saba("backup", "create", "-a", "plain", "--json"); code != api.ExitUsage || !strings.Contains(errOut, "no named volumes") {
+		t.Fatalf("an app without volumes: %d %s", code, errOut)
+	}
+}
+
 func TestNodesCertsAndSecretsThroughTheCLI(t *testing.T) {
 	startDaemon(t)
 

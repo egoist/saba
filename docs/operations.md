@@ -144,8 +144,8 @@ saba destroy old-api --yes
 saba destroy old-db --yes --volumes
 ```
 
-This removes the app's containers, images, deployment history and logs. Named volumes, and a
-database's backups on the server, are kept unless `--volumes` is given; backups in S3 are never
+This removes the app's containers, images, deployment history and logs. Named volumes, and the
+app's backups on the server, are kept unless `--volumes` is given; backups in S3 are never
 deleted. `destroy` never guesses the app from the current directory, always needs `--yes`, and
 refuses while other apps reference the app's variables.
 
@@ -173,6 +173,7 @@ saba doctor
 | `base_domain` | No base domain is set, so apps without custom domains have no URL |
 | `disk` | The disk holding saba's data is 90% full or more |
 | `backup-storage` | The last operation against the S3 backup bucket failed |
+| `backup:<app>` | The app's last scheduled backup failed, with the error |
 | `node:<name>` | A node is unreachable |
 | `cert:<name>` | A certificate could not be issued (with Let's Encrypt's error), or an uploaded one expires within two weeks |
 | `app:<name>` | An app is crashed, degraded, or has never deployed successfully |
@@ -186,5 +187,4 @@ fails, which makes it usable as a monitoring probe. See also [Troubleshooting](t
 - Superseded versions keep their images for rollbacks: the last 5 per app, or
   `saba server config set keep_versions N`.
 - `saba server prune` removes dangling images and build cache older than three days.
-- Database backups on the server follow their retention (`--keep`); manual ones stay until
-  deleted.
+- Backups on the server follow their retention (`--keep`); manual ones stay until deleted.

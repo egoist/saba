@@ -13,13 +13,60 @@ import (
 	"github.com/egoist/saba/internal/client"
 )
 
+// backupScope is how a backup command names its app: `saba db backup`
+// takes the database as its first argument, `saba backup` uses -a.
+type backupScope struct {
+	db bool
+}
+
+func (s backupScope) cmd() string {
+	if s.db {
+		return "saba db backup"
+	}
+	return "saba backup"
+}
+
+// use builds a command's usage line from the words after its name.
+func (s backupScope) use(verb, rest string) string {
+	if s.db {
+		rest = strings.TrimSpace("<database> " + rest)
+	}
+	return strings.TrimSpace(verb + " " + rest)
+}
+
+// args validates n to m positional arguments besides the database.
+func (s backupScope) args(n, m int) cobra.PositionalArgs {
+	if s.db {
+		n, m = n+1, m+1
+	}
+	return cobra.RangeArgs(n, m)
+}
+
+// split returns the app a command acts on and its remaining arguments.
+func (s backupScope) split(c *CLI, args []string) (string, []string, error) {
+	if s.db {
+		return args[0], args[1:], nil
+	}
+	name, err := c.app()
+	return name, args, err
+}
+
+// ref is how a message names the app in a command line.
+func (s backupScope) ref(name string) string {
+	if s.db {
+		return " " + name
+	}
+	return " -a " + name
+}
+
 // dbBackupCmds returns the `db backup` group and `db restore`.
 func (c *CLI) dbBackupCmds() []*cobra.Command {
-	backup := &cobra.Command{
-		Use:   "backup",
-		Short: "Create, schedule, download and delete database backups",
-		Long: `Backups are compressed dumps (pg_dump, mysqldump, mariadb-dump, mongodump)
-stored on the server in /var/lib/saba/backups/<database>/.
+	backup, restore := c.backupCmds(backupScope{db: true})
+	backup.Short = "Create, schedule, download and delete database backups"
+	backup.Long = `Backups of Postgres, MySQL, MariaDB and MongoDB are compressed dumps made by
+their own tools (pg_dump, mysqldump, mariadb-dump, mongodump) while the
+database runs. Other databases (Redis) are backed up as an archive of their
+data volume. Backups are stored on the server in /var/lib/saba/backups/<name>/.
 
 Scheduled backups are pruned to the newest --keep; manual ones are kept until
 you delete them.
@@ -27,8 +74,8 @@ you delete them.
 Configure S3-compatible storage once ("saba db backup s3 set") and every
 backup is also uploaded there. Listing, downloading and restoring then work
 from the bucket too, so the backups of a lost server are available on its
-replacement.`,
-		Example: `  saba db backup create main                    # dump now, keep it on the server
+replacement.`
+	backup.Example = `  saba db backup create main                    # dump now, keep it on the server
   saba db backup create main -o main.sql.gz     # ...and download it
   saba db backup schedule main @daily --keep 14 # automatic backups (UTC)
   saba db backup schedule main off
@@ -36,36 +83,85 @@ replacement.`,
   saba db backup download main latest
   saba db restore main --backup latest --yes
   saba db restore main ./main.sql.gz --yes
-  saba db backup s3 set --bucket my-backups --region eu-central-1`,
-	}
+  saba db backup s3 set --bucket my-backups --region eu-central-1`
+	backup.AddCommand(c.backupS3Cmd())
+	restore.Use = "restore <database> [file]"
+	return []*cobra.Command{backup, restore}
+}
 
-	var out string
+// backupCmd is `saba backup`: backups of any app.
+func (c *CLI) backupCmd() *cobra.Command {
+	backup, restore := c.backupCmds(backupScope{})
+	backup.Short = "Back up an app's volumes (or a database), on demand or on a schedule"
+	backup.Long = `Back up the data of an app. For an app with named volumes (volumes =
+["data:/data"]) a backup is a .tar.gz with one directory per volume, made
+next to the volumes by a small helper container, so the app's image needs no
+tools. Managed databases are dumped with their own tools, exactly like
+"saba db backup". Bind mounts (/host/path:/path) are not included.
+
+Backups run while the app keeps serving. Files written during the backup can
+be caught half-way; for data like SQLite that must not be copied while in
+use, --stop stops the app for the duration: requests wait in the proxy
+meanwhile (up to a minute) and nothing is refused.
+
+Backups are stored on the server in /var/lib/saba/backups/<app>/, mirrored to
+S3 when "saba db backup s3 set" is configured, and share retention,
+download and delete with database backups. A restore empties the volumes in
+the archive and unpacks it, with the app stopped; the archive is checked in
+full first, so a damaged file changes nothing.`
+	backup.Example = `  saba backup create                          # the app in ./saba.toml
+  saba backup create -a uploads --stop        # stop the app while archiving
+  saba backup schedule -a uploads @daily --keep 14
+  saba backup list -a uploads
+  saba backup download -a uploads latest -o .
+  saba backup restore -a uploads --backup latest --yes
+  saba backup restore -a uploads ./uploads-20270101T030000Z-scheduled.tar.gz --yes`
+	backup.AddCommand(restore)
+	return backup
+}
+
+// backupCmds builds the backup group and the restore command for a scope.
+func (c *CLI) backupCmds(s backupScope) (*cobra.Command, *cobra.Command) {
+	backup := &cobra.Command{Use: "backup"}
+
+	var (
+		out  string
+		stop bool
+	)
 	create := &cobra.Command{
-		Use:   "create <database>",
-		Short: "Back up a database now",
-		Args:  exactArgs(1),
+		Use:   s.use("create", ""),
+		Short: "Back up now",
+		Args:  s.args(0, 0),
 		RunE: func(cmd *cobra.Command, args []string) error {
+			name, _, err := s.split(c, args)
+			if err != nil {
+				return err
+			}
 			cl, err := c.api()
 			if err != nil {
 				return err
 			}
-			b, err := cl.BackupCreate(cmd.Context(), args[0])
+			b, err := cl.BackupCreate(cmd.Context(), name, api.BackupRequest{Stop: stop})
 			if err != nil {
 				return err
 			}
 			file := ""
 			if out != "" {
-				if file, err = c.downloadBackup(cmd, cl, args[0], b.ID, out); err != nil {
+				if file, err = c.downloadBackup(cmd, cl, name, b.ID, out); err != nil {
 					return err
 				}
 			}
 			return c.result(backupResult{Backup: b, SavedTo: file}, func() {
-				// With `-o -` the dump itself is on stdout; keep messages off it.
+				// With `-o -` the backup itself is on stdout; keep messages off it.
 				ui := c.ui
 				if out == "-" {
 					ui = newUI(c.stderr, c.noColor)
 				}
-				ui.success("Backup %s of %s created (%s, %s)", b.ID, ui.bold(args[0]), humanBytes(b.Size), b.Location)
+				what := ""
+				if len(b.Volumes) > 0 {
+					what = ", " + plural(len(b.Volumes), "volume") + ": " + strings.Join(b.Volumes, ", ")
+				}
+				ui.success("Backup %s of %s created (%s, %s%s)", b.ID, ui.bold(name), humanBytes(b.Size), b.Location, what)
 				if b.Warning != "" {
 					ui.printf("%s %s\n", ui.yellow("!"), b.Warning)
 				}
@@ -76,21 +172,26 @@ replacement.`,
 					if strings.Contains(b.Location, "s3") {
 						where = "on the server and in S3"
 					}
-					ui.note("Stored %s. Download it with `saba db backup download %s %s`.", where, args[0], b.ID)
+					ui.note("Stored %s. Download it with `%s download%s %s`.", where, s.cmd(), s.ref(name), b.ID)
 				}
 			})
 		},
 	}
 	create.Flags().StringVarP(&out, "output", "o", "", "Also download the backup to this file or directory (- for stdout)")
+	create.Flags().BoolVar(&stop, "stop", false, "Stop the app while its volumes are archived (requests wait); not for database dumps")
 
 	list := &cobra.Command{
-		Use: "list <database>", Aliases: []string{"ls"}, Short: "List stored backups", Args: exactArgs(1),
+		Use: s.use("list", ""), Aliases: []string{"ls"}, Short: "List stored backups", Args: s.args(0, 0),
 		RunE: func(cmd *cobra.Command, args []string) error {
+			name, _, err := s.split(c, args)
+			if err != nil {
+				return err
+			}
 			cl, err := c.api()
 			if err != nil {
 				return err
 			}
-			backups, err := cl.Backups(cmd.Context(), args[0])
+			backups, err := cl.Backups(cmd.Context(), name)
 			if err != nil {
 				return err
 			}
@@ -99,41 +200,45 @@ replacement.`,
 			}
 			return c.result(backups, func() {
 				if len(backups) == 0 {
-					c.ui.printf("%s has no backups. Create one with `saba db backup create %s`.\n", args[0], args[0])
+					c.ui.printf("%s has no backups. Create one with `%s create%s`.\n", name, s.cmd(), s.ref(name))
 					return
 				}
 				rows := make([][]string, 0, len(backups))
 				for _, b := range backups {
-					rows = append(rows, []string{b.ID, b.Kind, humanBytes(b.Size), b.Location, ago(b.CreatedAt)})
+					rows = append(rows, []string{b.ID, b.Kind, b.Method, humanBytes(b.Size), b.Location, ago(b.CreatedAt)})
 				}
-				c.ui.table([]string{"ID", "KIND", "SIZE", "LOCATION", "CREATED"}, rows)
+				c.ui.table([]string{"ID", "KIND", "METHOD", "SIZE", "LOCATION", "CREATED"}, rows)
 			})
 		},
 	}
 
 	var dlOut string
 	download := &cobra.Command{
-		Use:   "download <database> [id]",
+		Use:   s.use("download", "[id]"),
 		Short: "Download a stored backup (default: the latest)",
-		Args:  cobra.RangeArgs(1, 2),
+		Args:  s.args(0, 1),
 		RunE: func(cmd *cobra.Command, args []string) error {
+			name, rest, err := s.split(c, args)
+			if err != nil {
+				return err
+			}
 			cl, err := c.api()
 			if err != nil {
 				return err
 			}
 			id := "latest"
-			if len(args) == 2 {
-				id = args[1]
+			if len(rest) == 1 {
+				id = rest[0]
 			}
 			dest := dlOut
 			if dest == "" {
 				dest = "."
 			}
-			file, err := c.downloadBackup(cmd, cl, args[0], id, dest)
+			file, err := c.downloadBackup(cmd, cl, name, id, dest)
 			if err != nil {
 				return err
 			}
-			return c.result(map[string]string{"database": args[0], "file": file}, func() {
+			return c.result(map[string]string{"app": name, "file": file}, func() {
 				if file != "-" {
 					c.ui.success("Saved to %s", file)
 				}
@@ -144,103 +249,127 @@ replacement.`,
 
 	var delYes bool
 	del := &cobra.Command{
-		Use: "delete <database> <id>", Aliases: []string{"rm"}, Short: "Delete a stored backup", Args: exactArgs(2),
+		Use: s.use("delete", "<id>"), Aliases: []string{"rm"}, Short: "Delete a stored backup", Args: s.args(1, 1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			if err := c.confirm(delYes, "Deleting backup "+args[1], "saba db backup delete "+args[0]+" "+args[1]); err != nil {
+			name, rest, err := s.split(c, args)
+			if err != nil {
+				return err
+			}
+			if err := c.confirm(delYes, "Deleting backup "+rest[0], s.cmd()+" delete"+s.ref(name)+" "+rest[0]); err != nil {
 				return err
 			}
 			cl, err := c.api()
 			if err != nil {
 				return err
 			}
-			if err := cl.BackupDelete(cmd.Context(), args[0], args[1]); err != nil {
+			if err := cl.BackupDelete(cmd.Context(), name, rest[0]); err != nil {
 				return err
 			}
-			return c.result(map[string]string{"database": args[0], "deleted": args[1]}, func() {
-				c.ui.success("Backup %s deleted", args[1])
+			return c.result(map[string]string{"app": name, "deleted": rest[0]}, func() {
+				c.ui.success("Backup %s deleted", rest[0])
 			})
 		},
 	}
 	del.Flags().BoolVarP(&delYes, "yes", "y", false, "Confirm the deletion")
 
-	var keep int
+	var (
+		keep      int
+		schedStop bool
+	)
 	schedule := &cobra.Command{
-		Use:   "schedule <database> [cron|off]",
+		Use:   s.use("schedule", "[cron|off]"),
 		Short: "Show or set the automatic backup schedule",
 		Long: `Schedule automatic backups with a five-field cron expression or @hourly,
 @daily, @weekly, @monthly (UTC). "off" disables them. Without a schedule
-argument, the current policy is shown. The database is not restarted.`,
-		Example: "  saba db backup schedule main @daily\n  saba db backup schedule main \"0 */6 * * *\" --keep 28\n  saba db backup schedule main off",
-		Args:    cobra.RangeArgs(1, 2),
+argument, the current policy is shown. The app is not restarted.`,
+		Example: fmt.Sprintf("  %[1]s schedule%[2]s @daily\n  %[1]s schedule%[2]s \"0 */6 * * *\" --keep 28\n  %[1]s schedule%[2]s off",
+			s.cmd(), map[bool]string{true: " main", false: " -a uploads"}[s.db]),
+		Args: s.args(0, 1),
 		RunE: func(cmd *cobra.Command, args []string) error {
+			name, rest, err := s.split(c, args)
+			if err != nil {
+				return err
+			}
 			cl, err := c.api()
 			if err != nil {
 				return err
 			}
 			var policy *api.BackupPolicy
-			if len(args) == 1 {
-				app, err := cl.App(cmd.Context(), args[0])
+			if len(rest) == 0 {
+				app, err := cl.App(cmd.Context(), name)
 				if err != nil {
 					return err
 				}
-				if app.Database == nil {
-					return api.Errorf(api.CodeInvalid, "%q is not a managed database", args[0])
-				}
-				policy = app.Database.Backup
+				policy = app.Backup
 				if policy == nil {
 					policy = &api.BackupPolicy{}
 				}
-			} else if policy, err = cl.BackupPolicy(cmd.Context(), args[0], api.BackupPolicy{Schedule: args[1], Keep: keep}); err != nil {
+			} else if policy, err = cl.BackupPolicy(cmd.Context(), name, api.BackupPolicy{Schedule: rest[0], Keep: keep, Stop: schedStop}); err != nil {
 				return err
 			}
 			return c.result(policy, func() {
 				if policy.Schedule == "" {
-					c.ui.printf("Automatic backups of %s are off. Enable them with `saba db backup schedule %s @daily`.\n", args[0], args[0])
+					c.ui.printf("Automatic backups of %s are off. Enable them with `%s schedule%s @daily`.\n", name, s.cmd(), s.ref(name))
 					return
 				}
-				c.ui.success("%s is backed up on schedule %q (UTC), keeping the newest %d", c.ui.bold(args[0]), policy.Schedule, policy.Keep)
+				stopped := ""
+				if policy.Stop {
+					stopped = ", stopping it meanwhile"
+				}
+				c.ui.success("%s is backed up on schedule %q (UTC), keeping the newest %d%s", c.ui.bold(name), policy.Schedule, policy.Keep, stopped)
 			})
 		},
 	}
 	schedule.Flags().IntVar(&keep, "keep", 0, "Number of scheduled backups to retain (default 7)")
-	backup.AddCommand(create, list, download, del, schedule, c.backupS3Cmd())
+	schedule.Flags().BoolVar(&schedStop, "stop", false, "Stop the app while its volumes are archived (requests wait)")
+	backup.AddCommand(create, list, download, del, schedule)
 
 	var (
 		fromBackup string
 		yes        bool
 	)
 	restore := &cobra.Command{
-		Use:   "restore <database> [file]",
-		Short: "Restore a database from a stored backup or a dump file",
-		Long: `Load a backup into a running database, replacing the data it contains.
+		Use:   s.use("restore", "[file]"),
+		Short: "Restore from a stored backup or a local file",
+		Long: `Replace an app's data with a backup.
 
 The source is either a backup stored on the server (--backup <id>, or
-"latest") or a local dump file, plain or gzip-compressed (- reads stdin).
+"latest") or a local file (- reads stdin): a database dump, plain or
+gzip-compressed, or a volume archive (.tar or .tar.gz with one top-level
+directory per volume).
 
-For Postgres the restore runs in a single transaction: if it fails, the
-database is left unchanged. This command requires --yes.`,
-		Example: "  saba db restore main --backup latest --yes\n  saba db restore main ./main.sql.gz --yes\n  pg_dump ... | saba db restore main - --yes",
-		Args:    cobra.RangeArgs(1, 2),
+For a database dump, the database keeps running; for Postgres the restore is
+a single transaction, so a failed one changes nothing. For volumes, the
+archive is checked in full first, then the app is stopped, the volumes found
+in the archive are emptied and unpacked, and the app is started again
+(requests wait meanwhile). Volumes of the app that are not in the archive are
+left alone. This command requires --yes.`,
+		Example: fmt.Sprintf("  %[1]s --backup latest --yes\n  %[1]s ./backup.gz --yes", strings.TrimSuffix(map[bool]string{true: "saba db restore main", false: "saba backup restore -a uploads"}[s.db], " ")),
+		Args:    s.args(0, 1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			name := args[0]
-			if (len(args) == 2) == (fromBackup != "") {
-				return api.Errorf(api.CodeInvalid, "give exactly one source: a dump file or --backup <id>").
-					WithHint("Examples: `saba db restore %s --backup latest --yes` or `saba db restore %s ./dump.sql.gz --yes`.", name, name)
+			name, rest, err := s.split(c, args)
+			if err != nil {
+				return err
 			}
-			retry := "saba db restore " + name
+			restoreCmd := map[bool]string{true: "saba db restore", false: "saba backup restore"}[s.db] + s.ref(name)
+			if (len(rest) == 1) == (fromBackup != "") {
+				return api.Errorf(api.CodeInvalid, "give exactly one source: a file or --backup <id>").
+					WithHint("Examples: `%s --backup latest --yes` or `%s ./backup.gz --yes`.", restoreCmd, restoreCmd)
+			}
+			retry := restoreCmd
 			if fromBackup != "" {
 				retry += " --backup " + fromBackup
 			} else {
-				retry += " " + args[1]
+				retry += " " + rest[0]
 			}
 			var dump io.Reader
-			if len(args) == 2 {
-				if args[1] == "-" {
+			if len(rest) == 1 {
+				if rest[0] == "-" {
 					dump = os.Stdin
 				} else {
-					f, err := os.Open(args[1])
+					f, err := os.Open(rest[0])
 					if err != nil {
-						return api.Errorf(api.CodeInvalid, "cannot read %s: %v", args[1], err)
+						return api.Errorf(api.CodeInvalid, "cannot read %s: %v", rest[0], err)
 					}
 					defer f.Close()
 					dump = f
@@ -258,21 +387,29 @@ database is left unchanged. This command requires --yes.`,
 				return err
 			}
 			return c.result(res, func() {
-				if res.Backup != nil {
-					c.ui.success("%s restored from backup %s", c.ui.bold(name), res.Backup.ID)
+				src := ""
+				switch {
+				case res.Backup != nil:
+					src = "backup " + res.Backup.ID
+				case rest[0] == "-":
+					src = "stdin"
+				default:
+					src = rest[0]
+				}
+				if len(res.Volumes) > 0 {
+					c.ui.success("%s restored from %s (%s)", c.ui.bold(name), src, strings.Join(res.Volumes, ", "))
 				} else {
-					src := args[1]
-					if src == "-" {
-						src = "stdin"
-					}
 					c.ui.success("%s restored from %s", c.ui.bold(name), src)
+				}
+				if len(res.Skipped) > 0 {
+					c.ui.printf("%s Not restored, %s has no such volume: %s\n", c.ui.yellow("!"), name, strings.Join(res.Skipped, ", "))
 				}
 			})
 		},
 	}
 	restore.Flags().StringVar(&fromBackup, "backup", "", "Restore this stored backup (an id, or \"latest\")")
-	restore.Flags().BoolVarP(&yes, "yes", "y", false, "Confirm replacing the database's data")
-	return []*cobra.Command{backup, restore}
+	restore.Flags().BoolVarP(&yes, "yes", "y", false, "Confirm replacing the data")
+	return backup, restore
 }
 
 type backupResult struct {

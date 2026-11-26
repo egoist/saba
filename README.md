@@ -52,7 +52,7 @@ $ cd my-app && saba deploy
 | Config | Declarative `saba.toml`, or flags that the server remembers |
 | Secrets | `saba env set`, with `${{db.URL}}`-style references between apps |
 | Databases | Postgres, MySQL, MariaDB, Redis, MongoDB with volumes and generated credentials |
-| Backups | On-demand and scheduled database backups with retention, mirrored to S3-compatible storage; restore from the server or the bucket |
+| Backups | On-demand and scheduled backups of databases (dumps) and app volumes (archives), with retention, mirrored to S3-compatible storage; restore from the server or the bucket |
 | Cron | Scheduled commands in the app's image |
 | Operations | Logs, exec, one-off runs, stats, `saba doctor` diagnostics |
 | Upgrades | The daemon restarts without refusing or dropping requests (systemd socket activation) |
@@ -165,15 +165,21 @@ container names — `http://api:8080` resolves between containers on the same se
 publishes a port (`publish = ["10.0.0.1:5432:5432"]`) is also reachable by name from other
 nodes, at its server's address (`saba node add --address`, `saba server config set address`).
 
-## Database backups
+## Backups
 
 ```sh
 saba db backup schedule main @daily --keep 14     # automatic, newest 14 kept
 saba db backup create main                        # one right now
 saba db restore main --backup latest --yes
+
+saba backup schedule -a uploads @daily            # an app's volumes, as a .tar.gz
+saba backup create -a blog --stop                 # SQLite: stop the app meanwhile; requests wait
+saba backup restore -a uploads --backup latest --yes
 ```
 
-Backups are compressed dumps kept on the server. Point saba at any S3-compatible bucket (AWS
+Databases are dumped with their own tools; apps with volumes (and Redis) have their volumes
+archived. A restore checks the whole archive before it touches anything. Backups are kept on
+the server. Point saba at any S3-compatible bucket (AWS
 S3, Cloudflare R2, Backblaze B2, MinIO, RustFS, ...) and every backup is uploaded as well:
 
 ```sh
@@ -254,7 +260,7 @@ An [MCP](https://modelcontextprotocol.io) server exposes the same operations as 
 
 - Every deployment gets a version number and its own containers
   (`saba-<app>-v<N>-<replica>`), published on a loopback port that only the proxy uses.
-- State is one JSON file (`/var/lib/saba/state.json`); deployment logs and database backups
+- State is one JSON file (`/var/lib/saba/state.json`); deployment logs and backups
   are kept next to it.
 - Ports 80 and 443 belong to systemd and are handed to the daemon (socket activation). While
   the daemon restarts, connections wait in the kernel and in-flight requests finish first, so
@@ -292,7 +298,6 @@ saba is new. Known limitations:
   Worker nodes add capacity, not redundancy for the primary itself.
 - Volumes are per-server and containers find each other by name only on the same server (see
   "Scaling across servers").
-- Backups cover Postgres, MySQL, MariaDB and MongoDB; Redis is not supported by the backup
-  commands. Volumes of regular apps are not backed up.
+- Bind mounts (`/host/path:/path`) are not backed up; named volumes and databases are.
 - Anyone who can SSH in as root or as a member of the `docker` group can control saba. There
   are no per-user permissions; access control is SSH.

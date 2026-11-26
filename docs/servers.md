@@ -197,7 +197,7 @@ SABA_HOST=unix://$PWD/.saba/saba.sock saba status
 | `/run/saba/nodes/` | One socket per [node](scaling.md), reaching its Docker engine through its agent |
 | `/var/lib/saba/state.json` | All state: apps, configuration, **environment variables including secrets**, deployment history, nodes, settings. Root only |
 | `/var/lib/saba/logs/<app>/v<N>.ndjson` | Deployment logs |
-| `/var/lib/saba/backups/<database>/` | Database backups |
+| `/var/lib/saba/backups/<app>/` | Backups: database dumps and volume archives |
 | `/var/lib/saba/certs/acme/` | Issued certificates (on-demand and wildcard), ACME account keys, OCSP staples |
 | `/var/lib/saba/certs/store/` | Uploaded certificates |
 | `/var/lib/saba/cluster/` | The primary's cluster key, which agents pin |

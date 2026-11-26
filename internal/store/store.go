@@ -92,6 +92,14 @@ func Open(path string) (*Store, error) {
 	if s.state.Apps == nil {
 		s.state.Apps = map[string]*AppRecord{}
 	}
+	for _, a := range s.state.Apps {
+		if a.Database != nil && a.Database.LegacyBackup != nil {
+			if a.Backup == nil {
+				a.Backup = a.Database.LegacyBackup
+			}
+			a.Database.LegacyBackup = nil
+		}
+	}
 	return s, nil
 }
 

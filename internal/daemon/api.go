@@ -527,10 +527,16 @@ func (d *Daemon) handleBackups(w http.ResponseWriter, r *http.Request) error {
 }
 
 func (d *Daemon) handleBackupCreate(w http.ResponseWriter, r *http.Request) error {
-	// A dump runs to completion even if the client goes away.
+	var req api.BackupRequest
+	if r.ContentLength > 0 {
+		if err := readJSON(r, &req); err != nil {
+			return err
+		}
+	}
+	// A backup runs to completion even if the client goes away.
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), 6*time.Hour)
 	defer cancel()
-	b, err := d.engine.Backup(ctx, r.PathValue("app"), "manual")
+	b, err := d.engine.Backup(ctx, r.PathValue("app"), "manual", req)
 	if err != nil {
 		return err
 	}
@@ -576,24 +582,25 @@ func (d *Daemon) handleBackupPolicy(w http.ResponseWriter, r *http.Request) erro
 	return nil
 }
 
-// handleRestore restores a stored backup (?backup=<id>) or the dump sent as
-// the request body.
+// handleRestore restores a stored backup (?backup=<id>) or the backup sent
+// as the request body.
 func (d *Daemon) handleRestore(w http.ResponseWriter, r *http.Request) error {
 	name := r.PathValue("app")
 	// Abandoning a restore halfway would be worse than finishing it.
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), 6*time.Hour)
 	defer cancel()
 	if id := r.URL.Query().Get("backup"); id != "" {
-		b, err := d.engine.RestoreBackup(ctx, name, id)
+		res, err := d.engine.RestoreBackup(ctx, name, id)
 		if err != nil {
 			return err
 		}
-		writeJSON(w, http.StatusOK, map[string]any{"app": name, "restored": true, "backup": b})
+		writeJSON(w, http.StatusOK, res)
 		return nil
 	}
-	if err := d.engine.Restore(ctx, name, r.Body); err != nil {
+	res, err := d.engine.Restore(ctx, name, r.Body)
+	if err != nil {
 		return err
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"app": name, "restored": true})
+	writeJSON(w, http.StatusOK, res)
 	return nil
 }

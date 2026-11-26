@@ -232,7 +232,22 @@ the server because their upload failed (`LOCATION local` in `saba db backup list
 uploaded automatically once uploads work again, within the hour, or immediately when you run
 `saba db backup s3 set` again.
 
+### `has nothing to back up: it has no named volumes`
+
+The app keeps no data saba can back up: it has no named volumes, only bind mounts or none at
+all. Data written inside a container is lost on every deploy anyway; keep it in a named volume
+(`volumes = ["data:/data"]`). Back up bind-mounted host paths with your own tools.
+
+### A volume backup fails while the app writes
+
+`tar` can fail on files that change while they are read. Retry, or back up with `--stop`
+(also for schedules: `saba backup schedule -a <app> @daily --stop`).
+
 ### A restore failed
+
+For a volume restore that fails while unpacking, the volumes may be partly restored; run the
+restore again, which empties them first. A file that is not a valid archive is refused before
+anything changes.
 
 With `--json`, `error.details.output` has the database client's output. A PostgreSQL restore runs
 in one transaction, so a failure changes nothing; MySQL, MariaDB and MongoDB restores are not

@@ -24,6 +24,13 @@ These work with every command.
   - [`saba agent run`](#saba-agent-run) — Run the agent in the foreground (what the service runs)
   - [`saba agent uninstall`](#saba-agent-uninstall) — Stop the agent and remove it (containers and data on the node are kept)
 - [`saba apps`](#saba-apps) — List apps on the server
+- [`saba backup`](#saba-backup) — Back up an app's volumes (or a database), on demand or on a schedule
+  - [`saba backup create`](#saba-backup-create) — Back up now
+  - [`saba backup delete`](#saba-backup-delete) — Delete a stored backup
+  - [`saba backup download`](#saba-backup-download) — Download a stored backup (default: the latest)
+  - [`saba backup list`](#saba-backup-list) — List stored backups
+  - [`saba backup restore`](#saba-backup-restore) — Restore from a stored backup or a local file
+  - [`saba backup schedule`](#saba-backup-schedule) — Show or set the automatic backup schedule
 - [`saba cancel`](#saba-cancel) — Stop a deployment in progress
 - [`saba certs`](#saba-certs) — TLS certificates: status, wildcards through DNS, your own
   - [`saba certs add`](#saba-certs-add) — Upload a certificate to use for the names it lists
@@ -46,7 +53,7 @@ These work with every command.
   - [`saba daemon uninstall`](#saba-daemon-uninstall) — Stop and remove the systemd service (apps and data are kept)
 - [`saba db`](#saba-db) — Create and link managed databases
   - [`saba db backup`](#saba-db-backup) — Create, schedule, download and delete database backups
-    - [`saba db backup create`](#saba-db-backup-create) — Back up a database now
+    - [`saba db backup create`](#saba-db-backup-create) — Back up now
     - [`saba db backup delete`](#saba-db-backup-delete) — Delete a stored backup
     - [`saba db backup download`](#saba-db-backup-download) — Download a stored backup (default: the latest)
     - [`saba db backup list`](#saba-db-backup-list) — List stored backups
@@ -59,7 +66,7 @@ These work with every command.
   - [`saba db link`](#saba-db-link) — Give an app the database's URL as an environment variable
   - [`saba db list`](#saba-db-list) — List databases
   - [`saba db publish`](#saba-db-publish) — Expose a database on a host port, or stop exposing it
-  - [`saba db restore`](#saba-db-restore) — Restore a database from a stored backup or a dump file
+  - [`saba db restore`](#saba-db-restore) — Restore from a stored backup or a local file
   - [`saba db url`](#saba-db-url) — Print a database's connection URL and credentials
 - [`saba deploy`](#saba-deploy) — Deploy a directory, a git repository or an image
 - [`saba deployments`](#saba-deployments) — List an app's deployment history
@@ -164,6 +171,165 @@ saba apps
 ```
 
 Aliases: `ls`, `list`
+
+## saba backup
+
+Back up an app's volumes (or a database), on demand or on a schedule
+
+```text
+Back up the data of an app. For an app with named volumes (volumes =
+["data:/data"]) a backup is a .tar.gz with one directory per volume, made
+next to the volumes by a small helper container, so the app's image needs no
+tools. Managed databases are dumped with their own tools, exactly like
+"saba db backup". Bind mounts (/host/path:/path) are not included.
+
+Backups run while the app keeps serving. Files written during the backup can
+be caught half-way; for data like SQLite that must not be copied while in
+use, --stop stops the app for the duration: requests wait in the proxy
+meanwhile (up to a minute) and nothing is refused.
+
+Backups are stored on the server in /var/lib/saba/backups/<app>/, mirrored to
+S3 when "saba db backup s3 set" is configured, and share retention,
+download and delete with database backups. A restore empties the volumes in
+the archive and unpacks it, with the app stopped; the archive is checked in
+full first, so a damaged file changes nothing.
+```
+
+**Examples**
+
+```sh
+saba backup create                          # the app in ./saba.toml
+saba backup create -a uploads --stop        # stop the app while archiving
+saba backup schedule -a uploads @daily --keep 14
+saba backup list -a uploads
+saba backup download -a uploads latest -o .
+saba backup restore -a uploads --backup latest --yes
+saba backup restore -a uploads ./uploads-20270101T030000Z-scheduled.tar.gz --yes
+```
+
+Subcommands: [`create`](#saba-backup-create), [`delete`](#saba-backup-delete), [`download`](#saba-backup-download), [`list`](#saba-backup-list), [`restore`](#saba-backup-restore), [`schedule`](#saba-backup-schedule)
+
+## saba backup create
+
+Back up now
+
+```sh
+saba backup create [flags]
+```
+
+**Flags**
+
+| Flag | Default | Description |
+|---|---|---|
+| `-o, --output string` |  | Also download the backup to this file or directory (- for stdout) |
+| `--stop` |  | Stop the app while its volumes are archived (requests wait); not for database dumps |
+
+## saba backup delete
+
+Delete a stored backup
+
+```sh
+saba backup delete <id> [flags]
+```
+
+Aliases: `rm`
+
+**Flags**
+
+| Flag | Default | Description |
+|---|---|---|
+| `-y, --yes` |  | Confirm the deletion |
+
+## saba backup download
+
+Download a stored backup (default: the latest)
+
+```sh
+saba backup download [id] [flags]
+```
+
+**Flags**
+
+| Flag | Default | Description |
+|---|---|---|
+| `-o, --output string` |  | File or directory to write to (- for stdout; default: the current directory) |
+
+## saba backup list
+
+List stored backups
+
+```sh
+saba backup list
+```
+
+Aliases: `ls`
+
+## saba backup restore
+
+Restore from a stored backup or a local file
+
+```sh
+saba backup restore [file] [flags]
+```
+
+```text
+Replace an app's data with a backup.
+
+The source is either a backup stored on the server (--backup <id>, or
+"latest") or a local file (- reads stdin): a database dump, plain or
+gzip-compressed, or a volume archive (.tar or .tar.gz with one top-level
+directory per volume).
+
+For a database dump, the database keeps running; for Postgres the restore is
+a single transaction, so a failed one changes nothing. For volumes, the
+archive is checked in full first, then the app is stopped, the volumes found
+in the archive are emptied and unpacked, and the app is started again
+(requests wait meanwhile). Volumes of the app that are not in the archive are
+left alone. This command requires --yes.
+```
+
+**Examples**
+
+```sh
+saba backup restore -a uploads --backup latest --yes
+saba backup restore -a uploads ./backup.gz --yes
+```
+
+**Flags**
+
+| Flag | Default | Description |
+|---|---|---|
+| `--backup string` |  | Restore this stored backup (an id, or "latest") |
+| `-y, --yes` |  | Confirm replacing the data |
+
+## saba backup schedule
+
+Show or set the automatic backup schedule
+
+```sh
+saba backup schedule [cron|off] [flags]
+```
+
+```text
+Schedule automatic backups with a five-field cron expression or @hourly,
+@daily, @weekly, @monthly (UTC). "off" disables them. Without a schedule
+argument, the current policy is shown. The app is not restarted.
+```
+
+**Examples**
+
+```sh
+saba backup schedule -a uploads @daily
+saba backup schedule -a uploads "0 */6 * * *" --keep 28
+saba backup schedule -a uploads off
+```
+
+**Flags**
+
+| Flag | Default | Description |
+|---|---|---|
+| `--keep int` |  | Number of scheduled backups to retain (default 7) |
+| `--stop` |  | Stop the app while its volumes are archived (requests wait) |
 
 ## saba cancel
 
@@ -555,8 +721,10 @@ Subcommands: [`backup`](#saba-db-backup), [`create`](#saba-db-create), [`link`](
 Create, schedule, download and delete database backups
 
 ```text
-Backups are compressed dumps (pg_dump, mysqldump, mariadb-dump, mongodump)
-stored on the server in /var/lib/saba/backups/<database>/.
+Backups of Postgres, MySQL, MariaDB and MongoDB are compressed dumps made by
+their own tools (pg_dump, mysqldump, mariadb-dump, mongodump) while the
+database runs. Other databases (Redis) are backed up as an archive of their
+data volume. Backups are stored on the server in /var/lib/saba/backups/<name>/.
 
 Scheduled backups are pruned to the newest --keep; manual ones are kept until
 you delete them.
@@ -585,7 +753,7 @@ Subcommands: [`create`](#saba-db-backup-create), [`delete`](#saba-db-backup-dele
 
 ## saba db backup create
 
-Back up a database now
+Back up now
 
 ```sh
 saba db backup create <database> [flags]
@@ -596,6 +764,7 @@ saba db backup create <database> [flags]
 | Flag | Default | Description |
 |---|---|---|
 | `-o, --output string` |  | Also download the backup to this file or directory (- for stdout) |
+| `--stop` |  | Stop the app while its volumes are archived (requests wait); not for database dumps |
 
 ## saba db backup delete
 
@@ -736,7 +905,7 @@ saba db backup schedule <database> [cron|off] [flags]
 ```text
 Schedule automatic backups with a five-field cron expression or @hourly,
 @daily, @weekly, @monthly (UTC). "off" disables them. Without a schedule
-argument, the current policy is shown. The database is not restarted.
+argument, the current policy is shown. The app is not restarted.
 ```
 
 **Examples**
@@ -752,6 +921,7 @@ saba db backup schedule main off
 | Flag | Default | Description |
 |---|---|---|
 | `--keep int` |  | Number of scheduled backups to retain (default 7) |
+| `--stop` |  | Stop the app while its volumes are archived (requests wait) |
 
 ## saba db create
 
@@ -834,28 +1004,33 @@ saba db publish main --clear
 
 ## saba db restore
 
-Restore a database from a stored backup or a dump file
+Restore from a stored backup or a local file
 
 ```sh
 saba db restore <database> [file] [flags]
 ```
 
 ```text
-Load a backup into a running database, replacing the data it contains.
+Replace an app's data with a backup.
 
 The source is either a backup stored on the server (--backup <id>, or
-"latest") or a local dump file, plain or gzip-compressed (- reads stdin).
+"latest") or a local file (- reads stdin): a database dump, plain or
+gzip-compressed, or a volume archive (.tar or .tar.gz with one top-level
+directory per volume).
 
-For Postgres the restore runs in a single transaction: if it fails, the
-database is left unchanged. This command requires --yes.
+For a database dump, the database keeps running; for Postgres the restore is
+a single transaction, so a failed one changes nothing. For volumes, the
+archive is checked in full first, then the app is stopped, the volumes found
+in the archive are emptied and unpacked, and the app is started again
+(requests wait meanwhile). Volumes of the app that are not in the archive are
+left alone. This command requires --yes.
 ```
 
 **Examples**
 
 ```sh
 saba db restore main --backup latest --yes
-saba db restore main ./main.sql.gz --yes
-pg_dump ... | saba db restore main - --yes
+saba db restore main ./backup.gz --yes
 ```
 
 **Flags**
@@ -863,7 +1038,7 @@ pg_dump ... | saba db restore main - --yes
 | Flag | Default | Description |
 |---|---|---|
 | `--backup string` |  | Restore this stored backup (an id, or "latest") |
-| `-y, --yes` |  | Confirm replacing the database's data |
+| `-y, --yes` |  | Confirm replacing the data |
 
 ## saba db url
 

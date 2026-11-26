@@ -110,17 +110,19 @@ type CronJob struct {
 
 // App is the public view of an app.
 type App struct {
-	Name           string                `json:"name"`
-	Kind           string                `json:"kind"`
-	Config         AppConfig             `json:"config"`
-	CurrentVersion int                   `json:"current_version"`
-	LastVersion    int                   `json:"last_version"`
-	Stopped        bool                  `json:"stopped,omitempty"`
-	Database       *DatabaseInfo         `json:"database,omitempty"`
-	Deployments    []*Deployment         `json:"deployments,omitempty"`
-	Cron           map[string]*CronState `json:"cron_state,omitempty"`
-	CreatedAt      time.Time             `json:"created_at"`
-	UpdatedAt      time.Time             `json:"updated_at"`
+	Name           string        `json:"name"`
+	Kind           string        `json:"kind"`
+	Config         AppConfig     `json:"config"`
+	CurrentVersion int           `json:"current_version"`
+	LastVersion    int           `json:"last_version"`
+	Stopped        bool          `json:"stopped,omitempty"`
+	Database       *DatabaseInfo `json:"database,omitempty"`
+	// Backup is the automatic backup policy, if one is set.
+	Backup      *BackupPolicy         `json:"backup,omitempty"`
+	Deployments []*Deployment         `json:"deployments,omitempty"`
+	Cron        map[string]*CronState `json:"cron_state,omitempty"`
+	CreatedAt   time.Time             `json:"created_at"`
+	UpdatedAt   time.Time             `json:"updated_at"`
 
 	// Derived fields, filled in on read.
 	Status         string            `json:"status,omitempty"`
@@ -135,19 +137,30 @@ type DatabaseInfo struct {
 	Version string `json:"version"`
 	// EnvName is the conventional variable used when linking (DATABASE_URL, REDIS_URL...).
 	EnvName string `json:"env_name"`
-	// Backup is the automatic backup policy, if one is set.
-	Backup *BackupPolicy `json:"backup,omitempty"`
+	// LegacyBackup is where state files before 0.2 kept the backup policy
+	// (now App.Backup). It is only read, to migrate.
+	LegacyBackup *BackupPolicy `json:"backup,omitempty"`
 }
 
-// BackupPolicy schedules automatic backups of a database.
+// BackupPolicy schedules automatic backups of an app.
 type BackupPolicy struct {
 	// Schedule is a cron expression (UTC). Empty disables automatic backups.
 	Schedule string `json:"schedule"`
 	// Keep is how many scheduled backups are retained (default 7).
 	Keep int `json:"keep"`
+	// Stop stops the app while its volumes are archived, for files that
+	// cannot be copied safely while in use (SQLite, for one). Requests wait
+	// meanwhile. Database dumps never stop the database.
+	Stop bool `json:"stop,omitempty"`
 }
 
-// Backup is a stored database dump.
+// Backup methods.
+const (
+	BackupDump    = "dump"    // the database's own dump tool
+	BackupVolumes = "volumes" // a tar archive of the app's named volumes
+)
+
+// Backup is a stored backup: a database dump or an archive of volumes.
 type Backup struct {
 	ID  string `json:"id"`
 	App string `json:"app"`
@@ -159,10 +172,32 @@ type Backup struct {
 	// the upload to S3 failed.
 	Warning string `json:"warning,omitempty"`
 	// Kind is "manual" or "scheduled". Only scheduled backups are pruned.
-	Kind      string    `json:"kind"`
-	Engine    string    `json:"engine"`
+	Kind string `json:"kind"`
+	// Method is "dump" or "volumes".
+	Method string `json:"method"`
+	// Engine is the database engine, for dumps.
+	Engine string `json:"engine,omitempty"`
+	// Volumes are the volumes archived, on a volume backup just created.
+	Volumes   []string  `json:"volumes,omitempty"`
 	Size      int64     `json:"size"`
 	CreatedAt time.Time `json:"created_at"`
+}
+
+// BackupRequest asks for a backup now.
+type BackupRequest struct {
+	// Stop stops the app while its volumes are archived (see BackupPolicy.Stop).
+	Stop bool `json:"stop,omitempty"`
+}
+
+// RestoreResult reports a finished restore.
+type RestoreResult struct {
+	App      string  `json:"app"`
+	Restored bool    `json:"restored"`
+	Backup   *Backup `json:"backup,omitempty"`
+	// Volumes are the volumes whose contents were replaced.
+	Volumes []string `json:"volumes,omitempty"`
+	// Skipped are volumes in the archive that the app does not have.
+	Skipped []string `json:"skipped,omitempty"`
 }
 
 type CronState struct {

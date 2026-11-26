@@ -515,9 +515,9 @@ func (c *Client) Backups(ctx context.Context, name string) ([]api.Backup, error)
 	return out, c.json(ctx, "GET", appPath(name, "/backups"), nil, nil, &out)
 }
 
-func (c *Client) BackupCreate(ctx context.Context, name string) (*api.Backup, error) {
+func (c *Client) BackupCreate(ctx context.Context, name string, req api.BackupRequest) (*api.Backup, error) {
 	var out api.Backup
-	return &out, c.json(ctx, "POST", appPath(name, "/backups"), nil, nil, &out)
+	return &out, c.json(ctx, "POST", appPath(name, "/backups"), nil, req, &out)
 }
 
 // BackupDownload streams a stored backup (gzip) to w and returns its file name.
@@ -546,14 +546,8 @@ func (c *Client) BackupPolicy(ctx context.Context, name string, p api.BackupPoli
 	return &out, c.json(ctx, "PUT", appPath(name, "/backup-policy"), nil, p, &out)
 }
 
-type RestoreResult struct {
-	App      string      `json:"app"`
-	Restored bool        `json:"restored"`
-	Backup   *api.Backup `json:"backup,omitempty"`
-}
-
 // Restore loads a stored backup (id) or, when dump is non-nil, the given dump.
-func (c *Client) Restore(ctx context.Context, name, id string, dump io.Reader) (*RestoreResult, error) {
+func (c *Client) Restore(ctx context.Context, name, id string, dump io.Reader) (*api.RestoreResult, error) {
 	q := url.Values{}
 	ct := ""
 	if dump == nil {
@@ -566,7 +560,7 @@ func (c *Client) Restore(ctx context.Context, name, id string, dump io.Reader) (
 		return nil, err
 	}
 	defer resp.Body.Close()
-	var out RestoreResult
+	var out api.RestoreResult
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
 		return nil, api.Errorf(api.CodeInternal, "cannot decode server response: %v", err)
 	}

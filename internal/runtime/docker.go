@@ -315,6 +315,10 @@ func (d *Docker) Run(ctx context.Context, o RunOptions) (string, error) {
 func (d *Docker) RunOnce(ctx context.Context, o RunOptions, stdout, stderr io.Writer) (int, error) {
 	c := d.cmd(ctx)
 	args := []string{"run", "--rm", "--init"}
+	if o.Stdin != nil {
+		args = append(args, "-i")
+		c.Stdin = o.Stdin
+	}
 	runArgs, cleanup, err := d.runArgs(o, c)
 	if err != nil {
 		return -1, err

@@ -2,6 +2,7 @@
 package runtimetest
 
 import (
+	"archive/tar"
 	"context"
 	"fmt"
 	"io"
@@ -34,6 +35,9 @@ type Fake struct {
 	Loads int
 	// RunOnceFunc, if set, decides the exit code of one-off runs.
 	RunOnceFunc func(opts runtime.RunOptions) int
+	// volumes holds the files of named volumes: volume → path → content.
+	// One-off "tar" runs (volume backups and restores) read and write them.
+	volumes map[string]map[string]string
 }
 
 type fakeContainer struct {
@@ -71,7 +75,6 @@ var _ runtime.Runtime = (*Fake)(nil)
 
 func (f *Fake) Version(context.Context) (string, error)          { return "fake", nil }
 func (f *Fake) EnsureNetwork(context.Context, string) error      { return nil }
-func (f *Fake) RemoveVolume(context.Context, string) error       { return nil }
 func (f *Fake) Prune(context.Context) (string, error)            { return "", nil }
 func (f *Fake) SetRestart(context.Context, string, string) error { return nil }
 
@@ -240,7 +243,10 @@ func (f *Fake) serve(c *fakeContainer, behaviour string) error {
 	return nil
 }
 
-func (f *Fake) RunOnce(_ context.Context, o runtime.RunOptions, stdout, _ io.Writer) (int, error) {
+func (f *Fake) RunOnce(_ context.Context, o runtime.RunOptions, stdout, stderr io.Writer) (int, error) {
+	if len(o.Command) > 0 && (o.Command[0] == "tar" || o.Command[0] == "sh" && len(o.Command) > 2 && strings.Contains(o.Command[2], "tar -C /v -xpf -")) {
+		return f.volumeTar(o, stdout, stderr)
+	}
 	fmt.Fprintf(stdout, "ran %s\n", strings.Join(o.Command, " "))
 	f.mu.Lock()
 	fn := f.RunOnceFunc
@@ -409,4 +415,111 @@ func (f *Fake) SetRunOnce(fn func(opts runtime.RunOptions) int) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.RunOnceFunc = fn
+}
+
+// SetVolumeFile writes a file into a named volume.
+func (f *Fake) SetVolumeFile(volume, path, content string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.volumes == nil {
+		f.volumes = map[string]map[string]string{}
+	}
+	if f.volumes[volume] == nil {
+		f.volumes[volume] = map[string]string{}
+	}
+	f.volumes[volume][path] = content
+}
+
+// VolumeFiles returns a copy of a named volume's files.
+func (f *Fake) VolumeFiles(volume string) map[string]string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := map[string]string{}
+	for k, v := range f.volumes[volume] {
+		out[k] = v
+	}
+	return out
+}
+
+func (f *Fake) RemoveVolume(_ context.Context, name string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	delete(f.volumes, name)
+	return nil
+}
+
+// volumeTar plays the helper container of volume backups: volumes are
+// mounted as <volume>:/v/<dir>[:ro]; "tar -C /v -cf - <dirs>" archives them,
+// and the restore script clears the dirs it is given, then extracts stdin.
+func (f *Fake) volumeTar(o runtime.RunOptions, stdout, stderr io.Writer) (int, error) {
+	mounts := map[string]string{} // dir under /v → volume
+	readOnly := map[string]bool{}
+	for _, m := range o.Volumes {
+		parts := strings.Split(m, ":")
+		if len(parts) < 2 || !strings.HasPrefix(parts[1], "/v/") {
+			continue
+		}
+		dir := strings.TrimPrefix(parts[1], "/v/")
+		mounts[dir] = parts[0]
+		readOnly[dir] = len(parts) > 2 && parts[2] == "ro"
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.volumes == nil {
+		f.volumes = map[string]map[string]string{}
+	}
+	if o.Command[0] == "tar" {
+		tw := tar.NewWriter(stdout)
+		for _, dir := range o.Command[5:] {
+			vol, ok := mounts[dir]
+			if !ok {
+				fmt.Fprintf(stderr, "tar: %s: No such file or directory\n", dir)
+				return 1, nil
+			}
+			tw.WriteHeader(&tar.Header{Typeflag: tar.TypeDir, Name: dir + "/", Mode: 0o755})
+			paths := make([]string, 0, len(f.volumes[vol]))
+			for p := range f.volumes[vol] {
+				paths = append(paths, p)
+			}
+			sort.Strings(paths)
+			for _, p := range paths {
+				body := f.volumes[vol][p]
+				tw.WriteHeader(&tar.Header{Typeflag: tar.TypeReg, Name: dir + "/" + p, Mode: 0o644, Size: int64(len(body))})
+				io.WriteString(tw, body)
+			}
+		}
+		return 0, tw.Close()
+	}
+	for _, dir := range o.Command[4:] {
+		if readOnly[dir] {
+			fmt.Fprintf(stderr, "find: /v/%s: Read-only file system\n", dir)
+			return 1, nil
+		}
+		f.volumes[mounts[dir]] = map[string]string{}
+	}
+	tr := tar.NewReader(o.Stdin)
+	for {
+		h, err := tr.Next()
+		if err == io.EOF {
+			return 0, nil
+		}
+		if err != nil {
+			fmt.Fprintf(stderr, "tar: %v\n", err)
+			return 1, nil
+		}
+		dir, rest, _ := strings.Cut(strings.TrimPrefix(h.Name, "./"), "/")
+		vol, ok := mounts[dir]
+		if !ok {
+			fmt.Fprintf(stderr, "tar: %s: Cannot open: No such file or directory\n", h.Name)
+			return 1, nil
+		}
+		if h.Typeflag != tar.TypeReg || rest == "" {
+			continue
+		}
+		b, _ := io.ReadAll(tr)
+		if f.volumes[vol] == nil {
+			f.volumes[vol] = map[string]string{}
+		}
+		f.volumes[vol][rest] = string(b)
+	}
 }

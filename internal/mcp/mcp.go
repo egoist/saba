@@ -404,35 +404,43 @@ func tools() []tool {
 			},
 		},
 		{
-			Name:        "saba_db_backup",
-			Description: "Back up a managed database now. The compressed dump is stored on the server; returns its id and size.",
-			Props:       schema{"database": str("Database name.")}, Required: []string{"database"},
-			Args: func(in map[string]any) ([]string, error) {
-				return []string{"db", "backup", "create", getStr(in, "database")}, nil
-			},
-		},
-		{
-			Name: "saba_db_backups", ReadOnly: true,
-			Description: "List the stored backups of a managed database, newest first.",
-			Props:       schema{"database": str("Database name.")}, Required: []string{"database"},
-			Args: func(in map[string]any) ([]string, error) {
-				return []string{"db", "backup", "list", getStr(in, "database")}, nil
-			},
-		},
-		{
-			Name: "saba_db_restore", Destructive: true,
-			Description: "Restore a managed database from one of its stored backups, replacing its current data. Only call when the user explicitly asked for a restore.",
+			Name:        "saba_backup",
+			Description: "Back up an app now: a managed database is dumped with its own tool, any other app has its named volumes archived (.tar.gz). Stored on the server (and in S3 when configured); returns its id, size and method.",
 			Props: schema{
-				"database": str("Database name."),
-				"backup":   str("Backup id from saba_db_backups, or \"latest\"."),
-				"confirm":  flag("Must be true."),
+				"app":  str("App or database name."),
+				"stop": flag("Stop the app while its volumes are archived, for files unsafe to copy in use (SQLite). Requests wait meanwhile. Not for database dumps."),
 			},
-			Required: []string{"database", "backup", "confirm"},
+			Required: []string{"app"},
+			Args: func(in map[string]any) ([]string, error) {
+				args := []string{"backup", "create", "-a", getStr(in, "app")}
+				if getBool(in, "stop") {
+					args = append(args, "--stop")
+				}
+				return args, nil
+			},
+		},
+		{
+			Name: "saba_backups", ReadOnly: true,
+			Description: "List the stored backups of an app or database, newest first.",
+			Props:       schema{"app": str("App or database name.")}, Required: []string{"app"},
+			Args: func(in map[string]any) ([]string, error) {
+				return []string{"backup", "list", "-a", getStr(in, "app")}, nil
+			},
+		},
+		{
+			Name: "saba_restore", Destructive: true,
+			Description: "Restore an app or database from one of its stored backups, replacing its current data (for volume backups the app is stopped meanwhile). Only call when the user explicitly asked for a restore.",
+			Props: schema{
+				"app":     str("App or database name."),
+				"backup":  str("Backup id from saba_backups, or \"latest\"."),
+				"confirm": flag("Must be true."),
+			},
+			Required: []string{"app", "backup", "confirm"},
 			Args: func(in map[string]any) ([]string, error) {
 				if !getBool(in, "confirm") {
-					return nil, fmt.Errorf("set confirm to true to replace the data of %q with the backup", getStr(in, "database"))
+					return nil, fmt.Errorf("set confirm to true to replace the data of %q with the backup", getStr(in, "app"))
 				}
-				return []string{"db", "restore", getStr(in, "database"), "--backup", getStr(in, "backup"), "--yes"}, nil
+				return []string{"backup", "restore", "-a", getStr(in, "app"), "--backup", getStr(in, "backup"), "--yes"}, nil
 			},
 		},
 		{

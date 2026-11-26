@@ -58,7 +58,7 @@ context = "prod"      # deploy to this context unless --host/--context says othe
 | `command` | string | image `CMD` | Command to run instead of the image's default |
 | `release_command` | string | — | Runs to completion before the new version gets traffic. See [release commands](deploying.md#release-commands) |
 | `strategy` | string | `"rolling"` | `"rolling"` or `"recreate"`. See [strategies](deploying.md#strategies) |
-| `volumes` | list of strings | — | `"name:/path"` for a managed volume, `"/host/path:/path"` for a bind mount |
+| `volumes` | list of strings | — | `"name:/path"` for a managed volume, `"/host/path:/path"` for a bind mount. Managed volumes can be [backed up](databases.md#backing-up-app-volumes) |
 | `publish` | list of strings | — | Raw host ports: `"5432:5432"`, `"10.0.0.1:5432:5432"`, `"53:53/udp"`. Forces `recreate`; at most one replica |
 | `drain_timeout` | duration | `"30s"` | Time in-flight requests get to finish on the old version |
 | `stop_timeout` | duration | `"10s"` | Time between `SIGTERM` and `SIGKILL` when a container stops |

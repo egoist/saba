@@ -22,7 +22,7 @@ func newDatabase(t *testing.T, h *harness, name, engine string) string {
 	req := image("ok:1")
 	req.Kind = api.KindDatabase
 	req.Database = &api.DatabaseInfo{Engine: engine, Version: "1"}
-	req.Config = map[string]any{"health": map[string]any{"command": "true"}, "strategy": "recreate"}
+	req.Config = map[string]any{"health": map[string]any{"command": "true"}, "strategy": "recreate", "volumes": []any{"data:/data"}}
 	h.mustDeploy(name, req)
 	return containerName(name, 1, 1)
 }
@@ -43,7 +43,7 @@ func TestBackupAndRestore(t *testing.T) {
 	container := newDatabase(t, h, "main", "postgres")
 	h.rt.SetData(container, "rows: 1,2,3")
 
-	b, err := h.engine.Backup(ctx, "main", "manual")
+	b, err := h.engine.Backup(ctx, "main", "manual", api.BackupRequest{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -69,24 +69,24 @@ func TestBackupAndRestore(t *testing.T) {
 	}
 
 	// Uploaded dumps may be plain or gzip-compressed.
-	if err := h.engine.Restore(ctx, "main", strings.NewReader("plain dump")); err != nil || h.rt.Data(container) != "plain dump" {
+	if _, err := h.engine.Restore(ctx, "main", strings.NewReader("plain dump")); err != nil || h.rt.Data(container) != "plain dump" {
 		t.Fatalf("plain restore: %v, data %q", err, h.rt.Data(container))
 	}
 	var buf bytes.Buffer
 	gz := gzip.NewWriter(&buf)
 	gz.Write([]byte("gzipped dump"))
 	gz.Close()
-	if err := h.engine.Restore(ctx, "main", &buf); err != nil || h.rt.Data(container) != "gzipped dump" {
+	if _, err := h.engine.Restore(ctx, "main", &buf); err != nil || h.rt.Data(container) != "gzipped dump" {
 		t.Fatalf("gzip restore: %v, data %q", err, h.rt.Data(container))
 	}
 
 	// A dump the database rejects is reported with the client's output.
-	err = h.engine.Restore(ctx, "main", strings.NewReader("CORRUPT"))
+	_, err = h.engine.Restore(ctx, "main", strings.NewReader("CORRUPT"))
 	var ae *api.Error
 	if codeOf(err) != api.CodeCommandFailed || !asError(err, &ae) || !strings.Contains(ae.Details["output"].(string), "syntax error") {
 		t.Fatalf("failed restore: %v", err)
 	}
-	if err := h.engine.Restore(ctx, "main", strings.NewReader("")); codeOf(err) != api.CodeInvalid {
+	if _, err := h.engine.Restore(ctx, "main", strings.NewReader("")); codeOf(err) != api.CodeInvalid {
 		t.Fatalf("an empty dump should be rejected, got %v", err)
 	}
 	if _, err := h.engine.RestoreBackup(ctx, "main", "20000101T000000Z-manual"); codeOf(err) != api.CodeNotFound {
@@ -112,26 +112,27 @@ func asError(err error, target **api.Error) bool {
 	return ok
 }
 
-func TestBackupRequiresASupportedRunningDatabase(t *testing.T) {
+func TestBackupNeedsSomethingToBackUp(t *testing.T) {
 	h := newHarness(t)
 	ctx := context.Background()
 	h.mustDeploy("web", image("ok:1"))
 	newDatabase(t, h, "cache", "redis")
 	newDatabase(t, h, "main", "postgres")
 
-	if _, err := h.engine.Backup(ctx, "web", "manual"); codeOf(err) != api.CodeInvalid {
-		t.Fatalf("backing up an app: %v", err)
+	if _, err := h.engine.Backup(ctx, "web", "manual", api.BackupRequest{}); codeOf(err) != api.CodeInvalid || !strings.Contains(err.Error(), "no named volumes") {
+		t.Fatalf("backing up an app without volumes: %v", err)
 	}
-	if _, err := h.engine.Backup(ctx, "cache", "manual"); codeOf(err) != api.CodeInvalid || !strings.Contains(err.Error(), "redis") {
-		t.Fatalf("unsupported engine: %v", err)
+	// Databases without a dump tool are backed up through their volume.
+	if b, err := h.engine.Backup(ctx, "cache", "manual", api.BackupRequest{}); err != nil || b.Method != api.BackupVolumes || b.Engine != "" {
+		t.Fatalf("redis: %+v %v", b, err)
 	}
-	if _, err := h.engine.Backup(ctx, "ghost", "manual"); codeOf(err) != api.CodeNotFound {
+	if _, err := h.engine.Backup(ctx, "ghost", "manual", api.BackupRequest{}); codeOf(err) != api.CodeNotFound {
 		t.Fatalf("unknown database: %v", err)
 	}
 	if err := h.engine.Stop(ctx, "main"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := h.engine.Backup(ctx, "main", "manual"); codeOf(err) != api.CodeConflict {
+	if _, err := h.engine.Backup(ctx, "main", "manual", api.BackupRequest{}); codeOf(err) != api.CodeConflict {
 		t.Fatalf("stopped database: %v", err)
 	}
 }
@@ -165,12 +166,12 @@ func TestBackupScheduleAndRetention(t *testing.T) {
 	}
 
 	// Scheduled backups are pruned to the newest `keep`; manual ones are never pruned.
-	if _, err := h.engine.Backup(ctx, "main", "manual"); err != nil {
+	if _, err := h.engine.Backup(ctx, "main", "manual", api.BackupRequest{}); err != nil {
 		t.Fatal(err)
 	}
 	var ids []string
 	for i := 0; i < 4; i++ {
-		b, err := h.engine.Backup(ctx, "main", "scheduled")
+		b, err := h.engine.Backup(ctx, "main", "scheduled", api.BackupRequest{})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -209,7 +210,7 @@ func TestBackupScheduleAndRetention(t *testing.T) {
 	if entries, _ := os.ReadDir(filepath.Join(h.engine.DataDir, "backups", "main")); len(entries) != 3 {
 		t.Fatalf("destroy without --volumes must keep backups, found %d", len(entries))
 	}
-	if _, err := h.engine.Backup(ctx, "other", "manual"); err != nil {
+	if _, err := h.engine.Backup(ctx, "other", "manual", api.BackupRequest{}); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := h.engine.Destroy(ctx, "other", true); err != nil {
@@ -293,7 +294,7 @@ func TestBackupsAreMirroredToRemoteStorage(t *testing.T) {
 	h.rt.SetData(container, "before storage")
 
 	// A backup made before storage is configured is local only...
-	early, err := h.engine.Backup(ctx, "main", "manual")
+	early, err := h.engine.Backup(ctx, "main", "manual", api.BackupRequest{})
 	if err != nil || early.Location != "local" {
 		t.Fatalf("early backup: %+v %v", early, err)
 	}
@@ -305,7 +306,7 @@ func TestBackupsAreMirroredToRemoteStorage(t *testing.T) {
 	}
 
 	h.rt.SetData(container, "precious data")
-	b, err := h.engine.Backup(ctx, "main", "manual")
+	b, err := h.engine.Backup(ctx, "main", "manual", api.BackupRequest{})
 	if err != nil || b.Location != "local+s3" || b.Warning != "" {
 		t.Fatalf("mirrored backup: %+v %v", b, err)
 	}
@@ -332,7 +333,7 @@ func TestBackupsAreMirroredToRemoteStorage(t *testing.T) {
 	// An outage: the backup still succeeds locally, with a warning, and the
 	// failure is visible to `saba doctor`.
 	remote.down = true
-	local, err := h.engine.Backup(ctx, "main", "manual")
+	local, err := h.engine.Backup(ctx, "main", "manual", api.BackupRequest{})
 	if err != nil || local.Location != "local" || !strings.Contains(local.Warning, "upload to S3 failed") {
 		t.Fatalf("backup during an outage: %+v %v", local, err)
 	}
@@ -350,7 +351,7 @@ func TestBackupsAreMirroredToRemoteStorage(t *testing.T) {
 	}
 	var newest string
 	for i := 0; i < 3; i++ {
-		s, err := h.engine.Backup(ctx, "main", "scheduled")
+		s, err := h.engine.Backup(ctx, "main", "scheduled", api.BackupRequest{})
 		if err != nil {
 			t.Fatal(err)
 		}

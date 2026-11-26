@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"sort"
 	"strings"
 	"syscall"
 	"time"
@@ -61,7 +62,7 @@ func (d *Daemon) handleDoctor(w http.ResponseWriter, r *http.Request) error {
 	if s3cfg := st.Server.BackupS3; s3cfg != nil {
 		localOnly := 0
 		for _, name := range st.AppNames() {
-			if st.Apps[name].Kind != api.KindDatabase {
+			if st.Apps[name].Backup == nil && st.Apps[name].Kind != api.KindDatabase {
 				continue
 			}
 			list, _ := d.engine.Backups(ctx, name)
@@ -82,6 +83,18 @@ func (d *Daemon) handleDoctor(w http.ResponseWriter, r *http.Request) error {
 			add("backup-storage", true, "Backups are mirrored to s3://"+s3cfg.Bucket+"/"+s3cfg.Prefix, "")
 		}
 	}
+
+	d.backupMu.Lock()
+	failed := make([]string, 0, len(d.backupFailed))
+	for name := range d.backupFailed {
+		failed = append(failed, name)
+	}
+	sort.Strings(failed)
+	for _, name := range failed {
+		add("backup:"+name, false, "The last scheduled backup failed: "+d.backupFailed[name],
+			fmt.Sprintf("Try one now with `saba backup create -a %s` to see the full error; the schedule keeps running.", name))
+	}
+	d.backupMu.Unlock()
 
 	status := d.cluster.Status()
 	for _, name := range sortedKeys(st.Nodes) {

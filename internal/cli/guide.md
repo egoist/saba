@@ -98,6 +98,9 @@ saba db backup delete <db> <id> --yes | schedule <db> [<cron>|off] [--keep N]
 saba db backup s3 [show] | set --bucket B [--endpoint URL] [--region R] [--prefix P]
      [--access-key-id K] [--secret-access-key S|-] [--create-bucket] | remove
 saba db restore <db> (--backup <id>|latest | <file|->) --yes
+saba backup create [--stop] [-o ...] | list | download [id] | delete <id> --yes
+            | schedule [<cron>|off] [--keep N] [--stop] | restore (--backup <id> | <file>) --yes
+                              Any app (-a): volumes archived, databases dumped
 saba destroy <app> --yes [--volumes]
 
 saba context add <name> <user@host> | use <name> | list | remove <name>
@@ -196,11 +199,26 @@ saba db link main -a api              # sets DATABASE_URL=${{main.URL}} on api a
 Databases are reachable only from other apps (`main:5432`), keep data in a named volume, and are
 deleted with `saba destroy main --yes --volumes` (after unlinking: `saba env unset -a api DATABASE_URL`).
 
-## Database backups
+## Backups
 
-Supported: postgres, mysql, mariadb, mongo (not redis). Backups are gzip-compressed dumps kept
-on the server; ids are UTC timestamps (`20261126T105124Z-manual`); `latest` works for download
-and restore (delete needs the id).
+Postgres, mysql, mariadb and mongo are dumped with their own tools while running. Every other
+app with named volumes (redis too) is backed up as a .tar.gz of its volumes (one top-level
+directory per volume), made by a busybox helper container next to the volumes; bind mounts are
+not included. `saba backup ... -a <app>` works for every app, `saba db backup <db> ...` is the
+same for databases. Backups are kept on the server; ids are UTC timestamps
+(`20261126T105124Z-manual`); `latest` works for download and restore (delete needs the id);
+`method` in the JSON is `dump` or `volumes`.
+
+```
+saba backup create -a uploads --stop            # --stop: app stopped meanwhile, requests wait (SQLite)
+saba backup schedule -a uploads @daily --stop   # scheduled, same options
+saba backup restore -a uploads --backup latest --yes   # checks the whole archive first, stops the app,
+                                                       # empties + unpacks the volumes in it, starts it
+```
+
+A volume restore reports `volumes` (replaced) and `skipped` (in the archive, not in the app);
+volumes not in the archive are untouched. A failed scheduled backup shows in `saba doctor`
+as `backup:<app>`.
 
 ```
 saba db backup schedule main @daily --keep 14   # cron or @hourly/@daily/@weekly, UTC; "off" disables
@@ -209,7 +227,7 @@ saba db restore main --backup latest --yes      # or a local file, plain or .gz;
 ```
 
 Scheduled backups are pruned to the newest `--keep` (default 7); manual ones are never pruned.
-A Postgres restore is a single transaction: if it fails nothing changes. `saba destroy <db>
+A Postgres restore is a single transaction: if it fails nothing changes. `saba destroy <app>
 --volumes` also deletes its backups on the server; without `--volumes` they are kept.
 
 Off-site copies: `saba db backup s3 set --bucket <b> ...` mirrors every backup to

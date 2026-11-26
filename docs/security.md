@@ -80,8 +80,10 @@ server and checked against the release's `checksums.txt` before it replaces anyt
 
 ## Backups
 
-Dumps contain all of a database's data and are not encrypted by saba. On the server they are in
-`/var/lib/saba/backups/`, root only. In S3:
+Backups (database dumps and volume archives) contain all of an app's data and are not
+encrypted by saba. On the server they are in `/var/lib/saba/backups/`, root only. Volume
+backups and restores run `busybox:1.37` from Docker Hub with the app's volumes mounted, without
+network access; mirror or pre-pull that image if you do not want the server to fetch it. In S3:
 
 - enable server-side encryption on the bucket,
 - give saba a key scoped to that bucket (see the [policy](databases.md#providers)),

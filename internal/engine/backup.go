@@ -57,26 +57,63 @@ var backupIDRe = regexp.MustCompile(`^(\d{8}T\d{6}Z)-(manual|scheduled)$`)
 
 func (e *Engine) backupDir(app string) string { return filepath.Join(e.DataDir, "backups", app) }
 
-// database returns a running managed database, its container and dump spec.
-func (e *Engine) database(name string) (*store.AppRecord, *api.Replica, backupSpec, error) {
-	_, a, cur, err := e.current(name)
+// backupTarget is what a backup of an app consists of.
+type backupTarget struct {
+	app    *store.AppRecord
+	cur    *api.Deployment
+	method string // api.BackupDump or api.BackupVolumes
+	// dump
+	spec backupSpec
+	rep  *api.Replica
+	// volumes
+	node    string
+	volumes []appVolume
+}
+
+func (t *backupTarget) ext() string {
+	if t.method == api.BackupDump {
+		return t.spec.ext
+	}
+	return "tar"
+}
+
+// target works out how an app is backed up: managed databases with a dump
+// tool are dumped, every other app with named volumes has them archived.
+func (e *Engine) target(name string) (*backupTarget, error) {
+	st, a, cur, err := e.current(name)
 	if err != nil {
-		return nil, nil, backupSpec{}, err
+		return nil, err
 	}
-	if a.Kind != api.KindDatabase || a.Database == nil {
-		return nil, nil, backupSpec{}, api.Errorf(api.CodeInvalid, "%q is not a managed database", name).
-			WithHint("List databases with `saba db list`.")
+	t := &backupTarget{app: a, cur: cur}
+	if a.Kind == api.KindDatabase && a.Database != nil {
+		if spec, ok := backupSpecs[a.Database.Engine]; ok {
+			if a.Stopped || len(cur.Replicas) == 0 {
+				return nil, api.Errorf(api.CodeConflict, "%q is not running", name).
+					WithHint("Start it first: `saba start %s`.", name)
+			}
+			t.method, t.spec, t.rep = api.BackupDump, spec, &cur.Replicas[0]
+			return t, nil
+		}
 	}
-	spec, ok := backupSpecs[a.Database.Engine]
-	if !ok {
-		return nil, nil, backupSpec{}, api.Errorf(api.CodeInvalid, "backups are not supported for %s databases", a.Database.Engine).
-			WithHint("Supported engines: mariadb, mongo, mysql, postgres. For others, snapshot the volume saba-%s-data.", name)
+	vols, binds := appVolumes(name, &cur.Config)
+	if len(vols) == 0 {
+		err := api.Errorf(api.CodeInvalid, "%q has nothing to back up: it has no named volumes", name)
+		if binds > 0 {
+			return nil, err.WithHint("Bind mounts (/host/path:/path) are not backed up by saba; back up those host paths directly, or use a named volume (\"data:/path\").")
+		}
+		return nil, err.WithHint("Data in a container is lost on every deploy; keep it in a named volume: volumes = [\"data:/data\"].")
 	}
-	if a.Stopped || len(cur.Replicas) == 0 {
-		return nil, nil, backupSpec{}, api.Errorf(api.CodeConflict, "%q is not running", name).
-			WithHint("Start it first: `saba start %s`.", name)
+	t.method, t.volumes = api.BackupVolumes, vols
+	t.node = api.LocalNode
+	if len(cur.Replicas) > 0 {
+		t.node = cur.Replicas[0].Node
+	} else if nodes, err := placement(st, &cur.Config); err == nil && len(nodes) > 0 {
+		t.node = nodes[0]
 	}
-	return a, &cur.Replicas[0], spec, nil
+	if isLocal(t.node) {
+		t.node = api.LocalNode
+	}
+	return t, nil
 }
 
 func (e *Engine) backupLock(app string) *sync.Mutex {
@@ -93,9 +130,10 @@ func (e *Engine) backupLock(app string) *sync.Mutex {
 	return l
 }
 
-// Backup dumps a database into a compressed file on the server.
-func (e *Engine) Backup(ctx context.Context, name, kind string) (*api.Backup, error) {
-	a, rep, spec, err := e.database(name)
+// Backup backs an app up into a compressed file on the server: a database
+// dump, or an archive of the app's named volumes.
+func (e *Engine) Backup(ctx context.Context, name, kind string, req api.BackupRequest) (*api.Backup, error) {
+	t, err := e.target(name)
 	if err != nil {
 		return nil, err
 	}
@@ -110,26 +148,9 @@ func (e *Engine) Backup(ctx context.Context, name, kind string) (*api.Backup, er
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, err
 	}
-	// IDs are UTC timestamps, so they sort chronologically. A new backup is
-	// always newer than every existing one, even within the same second.
-	at := time.Now().UTC().Truncate(time.Second)
-	if existing, _ := e.Backups(ctx, name); len(existing) > 0 && !existing[0].CreatedAt.Before(at) {
-		at = existing[0].CreatedAt.Add(time.Second)
-	}
-	// The listing can miss remote backups while the storage is unreachable;
-	// the last id handed out by this process is a second guard.
-	e.mu.Lock()
-	if e.lastBackup == nil {
-		e.lastBackup = map[string]time.Time{}
-	}
-	if last := e.lastBackup[name]; !last.Before(at) {
-		at = last.Add(time.Second)
-	}
-	e.lastBackup[name] = at
-	e.mu.Unlock()
-	id := at.Format("20060102T150405Z") + "-" + kind
-	final := filepath.Join(dir, id+"."+spec.ext+".gz")
-	// Written under a temporary name so a failed dump never looks like a backup.
+	id := e.nextBackupID(ctx, name, kind)
+	final := filepath.Join(dir, id+"."+t.ext()+".gz")
+	// Written under a temporary name so a failed backup never looks like one.
 	tmp := final + ".partial"
 	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
 	if err != nil {
@@ -141,15 +162,14 @@ func (e *Engine) Backup(ctx context.Context, name, kind string) (*api.Backup, er
 		return nil, err
 	}
 	gz := gzip.NewWriter(f)
-	var stderr tail
-	code, err := e.rt(rep.Node).Exec(ctx, rep.Container, []string{"sh", "-c", spec.dump}, nil, gz, &stderr)
-	if err != nil {
-		return fail(api.Errorf(api.CodeRuntime, "backup of %q failed: %v", name, err))
+	var volumes []string
+	if t.method == api.BackupDump {
+		err = e.dump(ctx, t, gz)
+	} else {
+		volumes, err = e.archiveVolumes(ctx, t, gz, req.Stop)
 	}
-	if code != 0 {
-		return fail(api.Errorf(api.CodeCommandFailed, "backup of %q failed: the dump command exited with code %d", name, code).
-			WithDetail("output", stderr.String()).
-			WithHint("Check that the database is healthy: `saba status %s` and `saba logs %s`.", name, name))
+	if err != nil {
+		return fail(err)
 	}
 	if err := gz.Close(); err != nil {
 		return fail(err)
@@ -169,7 +189,8 @@ func (e *Engine) Backup(ctx context.Context, name, kind string) (*api.Backup, er
 	if err != nil {
 		return nil, err
 	}
-	e.Log.Info("backup created", "app", name, "id", id, "bytes", b.Size)
+	b.Volumes = volumes
+	e.Log.Info("backup created", "app", name, "id", id, "method", t.method, "bytes", b.Size)
 	if remote := e.remote(); remote != nil {
 		uploadErr := e.upload(ctx, remote, name, b.File)
 		if uploadErr != nil {
@@ -199,12 +220,50 @@ func (e *Engine) Backup(ctx context.Context, name, kind string) (*api.Backup, er
 	}
 	if kind == "scheduled" {
 		keep := defaultBackupKeep
-		if p := a.Database.Backup; p != nil && p.Keep > 0 {
+		if p := t.app.Backup; p != nil && p.Keep > 0 {
 			keep = p.Keep
 		}
 		e.pruneBackups(ctx, name, keep)
 	}
 	return b, nil
+}
+
+// nextBackupID returns a new backup id. IDs are UTC timestamps, so they sort
+// chronologically; a new backup is always newer than every existing one,
+// even within the same second.
+func (e *Engine) nextBackupID(ctx context.Context, name, kind string) string {
+	at := time.Now().UTC().Truncate(time.Second)
+	if existing, _ := e.Backups(ctx, name); len(existing) > 0 && !existing[0].CreatedAt.Before(at) {
+		at = existing[0].CreatedAt.Add(time.Second)
+	}
+	// The listing can miss remote backups while the storage is unreachable;
+	// the last id handed out by this process is a second guard.
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.lastBackup == nil {
+		e.lastBackup = map[string]time.Time{}
+	}
+	if last := e.lastBackup[name]; !last.Before(at) {
+		at = last.Add(time.Second)
+	}
+	e.lastBackup[name] = at
+	return at.Format("20060102T150405Z") + "-" + kind
+}
+
+// dump runs the database's dump tool inside its container.
+func (e *Engine) dump(ctx context.Context, t *backupTarget, w io.Writer) error {
+	name := t.app.Name
+	var stderr tail
+	code, err := e.rt(t.rep.Node).Exec(ctx, t.rep.Container, []string{"sh", "-c", t.spec.dump}, nil, w, &stderr)
+	if err != nil {
+		return api.Errorf(api.CodeRuntime, "backup of %q failed: %v", name, err)
+	}
+	if code != 0 {
+		return api.Errorf(api.CodeCommandFailed, "backup of %q failed: the dump command exited with code %d", name, code).
+			WithDetail("output", stderr.String()).
+			WithHint("Check that the database is healthy: `saba status %s` and `saba logs %s`.", name, name)
+	}
+	return nil
 }
 
 // RemoteStore is off-site storage that backups are mirrored to.
@@ -312,10 +371,14 @@ func parseBackupFile(name, file string) (api.Backup, bool) {
 		return api.Backup{}, false
 	}
 	created, _ := time.Parse("20060102T150405Z", m[1])
-	return api.Backup{ID: id, App: name, File: file, Kind: m[2], CreatedAt: created}, true
+	method := api.BackupDump
+	if strings.HasPrefix(file[len(id):], ".tar.") {
+		method = api.BackupVolumes
+	}
+	return api.Backup{ID: id, App: name, File: file, Kind: m[2], Method: method, CreatedAt: created}, true
 }
 
-// Backups lists a database's backups, newest first: the ones on this server
+// Backups lists an app's backups, newest first: the ones on this server
 // merged with the ones in remote storage. That makes backups of a lost
 // server visible on its replacement as soon as the storage is configured.
 func (e *Engine) Backups(ctx context.Context, name string) ([]api.Backup, error) {
@@ -338,7 +401,10 @@ func (e *Engine) Backups(ctx context.Context, name string) ([]api.Backup, error)
 		if !ok || ierr != nil {
 			continue
 		}
-		b.Engine, b.Size, b.Location = engine, info.Size(), "local"
+		b.Size, b.Location = info.Size(), "local"
+		if b.Method == api.BackupDump {
+			b.Engine = engine
+		}
 		byID[b.ID] = &b
 	}
 	if remote := e.remote(); remote != nil {
@@ -356,7 +422,10 @@ func (e *Engine) Backups(ctx context.Context, name string) ([]api.Backup, error)
 				local.Location = "local+s3"
 				continue
 			}
-			b.Engine, b.Size, b.Location = engine, o.Size, "s3"
+			b.Size, b.Location = o.Size, "s3"
+			if b.Method == api.BackupDump {
+				b.Engine = engine
+			}
 			byID[b.ID] = &b
 		}
 	}
@@ -382,7 +451,7 @@ func (e *Engine) backup(ctx context.Context, name, id string) (*api.Backup, erro
 		}
 	}
 	return nil, api.Errorf(api.CodeNotFound, "%q has no backup %q", name, id).
-		WithHint("List backups with `saba db backup list %s`.", name)
+		WithHint("List backups with `saba backup list -a %s`.", name)
 }
 
 // OpenBackup opens a backup (gzip-compressed) for reading: the local copy if
@@ -442,60 +511,147 @@ func (e *Engine) DeleteBackup(ctx context.Context, name, id string) error {
 	return e.removeBackup(ctx, name, *b)
 }
 
-// Restore loads a dump into a database. The input may be gzip-compressed.
-func (e *Engine) Restore(ctx context.Context, name string, r io.Reader) error {
-	a, rep, spec, err := e.database(name)
+// Restore loads a backup sent by the client: a dump into a database (plain
+// or gzip-compressed), or a volume archive into the app's volumes.
+func (e *Engine) Restore(ctx context.Context, name string, r io.Reader) (*api.RestoreResult, error) {
+	t, err := e.target(name)
 	if err != nil {
-		return err
+		return nil, err
 	}
+	if t.method == api.BackupVolumes {
+		// The archive is checked completely before any volume is emptied, so
+		// it is kept on disk first.
+		file, err := e.spool(r)
+		if err != nil {
+			return nil, err
+		}
+		defer os.Remove(file)
+		return e.restoreVolumes(ctx, t, file)
+	}
+	return e.restoreDump(ctx, t, r)
+}
+
+func (e *Engine) restoreDump(ctx context.Context, t *backupTarget, r io.Reader) (*api.RestoreResult, error) {
+	name := t.app.Name
 	lock := e.backupLock(name)
 	if !lock.TryLock() {
-		return api.Errorf(api.CodeConflict, "a backup or restore of %q is already running", name).
+		return nil, api.Errorf(api.CodeConflict, "a backup or restore of %q is already running", name).
 			WithHint("Wait for it to finish, then retry.")
 	}
 	defer lock.Unlock()
 
-	br := bufio.NewReaderSize(r, 64*1024)
-	var in io.Reader = br
-	if magic, _ := br.Peek(2); len(magic) == 2 && magic[0] == 0x1f && magic[1] == 0x8b {
-		gz, err := gzip.NewReader(br)
-		if err != nil {
-			return api.Errorf(api.CodeInvalid, "the backup is not a valid gzip file: %v", err)
-		}
-		defer gz.Close()
-		in = gz
-	} else if len(magic) == 0 {
-		return api.Errorf(api.CodeInvalid, "the backup is empty")
-	}
-	var stderr tail
-	code, err := e.rt(rep.Node).Exec(ctx, rep.Container, []string{"sh", "-c", spec.restore}, in, discard{}, &stderr)
+	in, closeIn, err := decompressed(r)
 	if err != nil {
-		return api.Errorf(api.CodeRuntime, "restore of %q failed: %v", name, err)
+		return nil, err
+	}
+	defer closeIn()
+	var stderr tail
+	code, err := e.rt(t.rep.Node).Exec(ctx, t.rep.Container, []string{"sh", "-c", t.spec.restore}, in, discard{}, &stderr)
+	if err != nil {
+		return nil, api.Errorf(api.CodeRuntime, "restore of %q failed: %v", name, err)
 	}
 	if code != 0 {
-		return api.Errorf(api.CodeCommandFailed, "restore of %q failed: the restore command exited with code %d", name, code).
+		return nil, api.Errorf(api.CodeCommandFailed, "restore of %q failed: the restore command exited with code %d", name, code).
 			WithDetail("output", stderr.String()).
-			WithHint("The database client's output is in details.output. Make sure the file is a %s dump.", a.Database.Engine)
+			WithHint("The database client's output is in details.output. Make sure the file is a %s dump.", t.app.Database.Engine)
 	}
 	e.Log.Info("backup restored", "app", name)
-	return nil
+	return &api.RestoreResult{App: name, Restored: true}, nil
+}
+
+// decompressed returns r, gunzipped if it starts like a gzip stream.
+func decompressed(r io.Reader) (io.Reader, func(), error) {
+	br := bufio.NewReaderSize(r, 64*1024)
+	magic, _ := br.Peek(2)
+	switch {
+	case len(magic) == 0:
+		return nil, nil, api.Errorf(api.CodeInvalid, "the backup is empty")
+	case len(magic) == 2 && magic[0] == 0x1f && magic[1] == 0x8b:
+		gz, err := gzip.NewReader(br)
+		if err != nil {
+			return nil, nil, api.Errorf(api.CodeInvalid, "the backup is not a valid gzip file: %v", err)
+		}
+		return gz, func() { gz.Close() }, nil
+	}
+	return br, func() {}, nil
 }
 
 // RestoreBackup restores a stored backup, from this server or from remote storage.
-func (e *Engine) RestoreBackup(ctx context.Context, name, id string) (*api.Backup, error) {
-	r, b, err := e.OpenBackup(ctx, name, id)
+func (e *Engine) RestoreBackup(ctx context.Context, name, id string) (*api.RestoreResult, error) {
+	t, err := e.target(name)
 	if err != nil {
 		return nil, err
 	}
-	defer r.Close()
-	return b, e.Restore(ctx, name, r)
+	b, err := e.backup(ctx, name, id)
+	if err != nil {
+		return nil, err
+	}
+	if b.Method != t.method {
+		what := map[string]string{api.BackupDump: "a database dump", api.BackupVolumes: "a volume archive"}
+		return nil, api.Errorf(api.CodeInvalid, "backup %s is %s, but %q is restored from %s", b.ID, what[b.Method], name, what[t.method])
+	}
+	var res *api.RestoreResult
+	if t.method == api.BackupVolumes {
+		file := filepath.Join(e.backupDir(name), b.File)
+		if !strings.HasPrefix(b.Location, "local") {
+			r, _, err := e.OpenBackup(ctx, name, b.ID)
+			if err != nil {
+				return nil, err
+			}
+			file, err = e.spool(r)
+			r.Close()
+			if err != nil {
+				return nil, err
+			}
+			defer os.Remove(file)
+		}
+		res, err = e.restoreVolumes(ctx, t, file)
+	} else {
+		r, _, oerr := e.OpenBackup(ctx, name, b.ID)
+		if oerr != nil {
+			return nil, oerr
+		}
+		defer r.Close()
+		res, err = e.restoreDump(ctx, t, r)
+	}
+	if err != nil {
+		return nil, err
+	}
+	res.Backup = b
+	return res, nil
+}
+
+// spool copies r to a temporary file under the data directory.
+func (e *Engine) spool(r io.Reader) (string, error) {
+	dir := filepath.Join(e.DataDir, "tmp")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return "", err
+	}
+	f, err := os.CreateTemp(dir, "restore-*")
+	if err != nil {
+		return "", err
+	}
+	if _, err := io.Copy(f, r); err != nil {
+		f.Close()
+		os.Remove(f.Name())
+		return "", api.Errorf(api.CodeRuntime, "cannot receive the backup: %v", err)
+	}
+	if err := f.Close(); err != nil {
+		os.Remove(f.Name())
+		return "", err
+	}
+	return f.Name(), nil
 }
 
 // SetBackupPolicy enables, changes or (with an empty schedule) disables
-// automatic backups. It does not restart the database.
+// automatic backups. It does not restart the app.
 func (e *Engine) SetBackupPolicy(name string, p api.BackupPolicy) (*api.BackupPolicy, error) {
-	if _, _, _, err := e.database(name); err != nil {
+	t, err := e.target(name)
+	if err != nil {
 		return nil, err
+	}
+	if p.Stop && t.method == api.BackupDump {
+		return nil, api.Errorf(api.CodeInvalid, "--stop applies to volume backups; %q is backed up with its dump tool while it runs", name)
 	}
 	p.Schedule = strings.TrimSpace(p.Schedule)
 	if p.Schedule == "off" || p.Schedule == "none" {
@@ -514,28 +670,28 @@ func (e *Engine) SetBackupPolicy(name string, p api.BackupPolicy) (*api.BackupPo
 		return nil, api.Errorf(api.CodeInvalid, "keep must be between 1 and 365")
 	}
 	var out *api.BackupPolicy
-	err := e.Store.UpdateApp(name, func(a *store.AppRecord) error {
+	err = e.Store.UpdateApp(name, func(a *store.AppRecord) error {
 		if p.Schedule == "" {
-			a.Database.Backup = nil
+			a.Backup = nil
 			return nil
 		}
-		a.Database.Backup = &p
+		a.Backup = &p
 		out = &p
 		return nil
 	})
 	return out, err
 }
 
-// DueBackups returns the databases whose backup schedule matches t.
+// DueBackups returns the apps whose backup schedule matches t.
 func (e *Engine) DueBackups(t time.Time) []string {
 	var due []string
 	st := e.Store.Snapshot()
 	for _, name := range st.AppNames() {
 		a := st.Apps[name]
-		if a.Database == nil || a.Database.Backup == nil || a.Stopped || a.Current() == nil {
+		if a.Backup == nil || a.Stopped || a.Current() == nil {
 			continue
 		}
-		if s, err := cron.Parse(a.Database.Backup.Schedule); err == nil && s.Matches(t) {
+		if s, err := cron.Parse(a.Backup.Schedule); err == nil && s.Matches(t) {
 			due = append(due, name)
 		}
 	}

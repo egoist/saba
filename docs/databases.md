@@ -2,7 +2,8 @@
 
 saba runs databases next to your apps: one command creates one with a persistent volume and
 generated credentials, another connects it to an app, and backups can be scheduled and copied
-to S3-compatible storage.
+to S3-compatible storage. The same backups work for any app that keeps data in volumes (see
+[Backing up app volumes](#backing-up-app-volumes)).
 
 ## Creating a database
 
@@ -130,9 +131,10 @@ Backups in S3 are never deleted by `destroy`.
 
 ## Backups
 
-Backups are compressed dumps made with the engine's own tool, run inside the database's
-container. Supported: PostgreSQL, MySQL, MariaDB and MongoDB. Redis is not; it persists to its
-volume with append-only files.
+Backups of PostgreSQL, MySQL, MariaDB and MongoDB are compressed dumps made with the engine's
+own tool, run inside the database's container while it keeps serving. Redis, which has no dump
+tool, is backed up as an archive of its data volume, like any
+[app with volumes](#backing-up-app-volumes); its restore stops Redis for a moment.
 
 | Engine | Dump | Restore |
 |---|---|---|
@@ -202,6 +204,54 @@ existing data depends on the engine:
 - **MongoDB**: collections in the dump are dropped and restored. Not atomic either.
 
 A failed restore reports the database client's output under `details.output` with `--json`.
+
+## Backing up app volumes
+
+An app that keeps data in [named volumes](configuration.md#top-level) (`volumes =
+["data:/data"]`: uploads, SQLite files, a search index) is backed up with `saba backup`, which
+takes the app like every other command (`-a`, `saba.toml` or `SABA_APP`):
+
+```sh
+saba backup create -a uploads                     # archive the volumes now
+saba backup create -a uploads --stop              # ...with the app stopped meanwhile
+saba backup schedule -a uploads @daily --keep 14  # automatically (add --stop to stop it each time)
+saba backup list -a uploads
+saba backup download -a uploads latest -o ./
+saba backup restore -a uploads --backup latest --yes
+saba backup restore -a uploads ./uploads-20270101T030000Z-scheduled.tar.gz --yes
+```
+
+A backup is a `.tar.gz` with a small manifest and one top-level directory per volume, holding
+its files with their permissions, owners (numeric), timestamps, symlinks and hard links. It is
+made by a short-lived `busybox` container that mounts the volumes read-only next to the app, on
+the server the app runs on, so the app's own image needs no tools and works even when it is
+distroless. Bind mounts (`/host/path:/path`) are not included.
+
+Everything else is shared with database backups: IDs, storage in
+`/var/lib/saba/backups/<app>/`, retention, [S3 mirroring](#off-site-backups-with-s3),
+download and delete. `saba backup` also works for databases (it dumps them), so one set of
+commands covers every app.
+
+**Consistency.** By default the archive is made while the app keeps running, which is right
+for files that are written whole (uploads, generated assets). Data that changes in place while
+it is read, like an SQLite database or a search index, can be caught half-written. For those,
+`--stop` stops the app for the duration: the proxy holds incoming requests (up to a minute),
+in-flight requests finish first, and the app is started and health-checked again afterwards,
+so requests are delayed, not refused. A small SQLite database takes well under a second.
+
+**Restoring** replaces the contents of the volumes in the archive:
+
+1. the whole archive is read and checked first: a truncated or corrupt file, paths that leave
+   the volume, or a link pointing out of it are refused, and nothing changes,
+2. the app is stopped (requests wait, as with `--stop`),
+3. each volume in the archive is emptied and unpacked,
+4. the app is started and health-checked.
+
+Volumes of the app that are not in the archive are left alone; volumes in the archive that the
+app does not have are reported as skipped. Volumes are matched by name, so an archive restores
+into another app with the same volume names too (`saba backup restore -a staging-uploads
+./uploads-....tar.gz --yes`). Any `.tar` or `.tar.gz` laid out with one directory per volume
+works, so data can also be imported from elsewhere.
 
 ## Off-site backups with S3
 

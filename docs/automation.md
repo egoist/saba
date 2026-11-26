@@ -98,7 +98,8 @@ Events look like this (the `result` is abridged):
 ### No prompts, no surprises
 
 - saba never asks a question. Destructive commands fail with `confirmation_required` until you
-  add `--yes`: `destroy`, `db restore`, `db backup delete`, `node remove`, `certs remove`.
+  add `--yes`: `destroy`, `db restore`, `backup restore`, `db backup delete`, `backup delete`, `node remove`,
+  `certs remove`.
 - Nothing follows or waits forever by default. `logs` prints and exits unless `-f`; `deploy`
   returns when the version is live or has failed (`-d` returns immediately). Interrupting a
   command never interrupts the deployment; `saba cancel` does, and returns
@@ -215,7 +216,7 @@ context. Pin it explicitly, so an agent cannot drift to another server.
 | `saba_domains` | List, add or remove domains |
 | `saba_exec` | Run a command in a replica, or in a one-off container |
 | `saba_db_create`, `saba_db_link` | Databases |
-| `saba_db_backup`, `saba_db_backups`, `saba_db_restore` | Backups |
+| `saba_backup`, `saba_backups`, `saba_restore` | Backups of databases and app volumes |
 | `saba_nodes`, `saba_certs`, `saba_doctor` | Cluster, certificates, diagnostics |
 | `saba_destroy` | Delete an app |
 
@@ -223,7 +224,7 @@ Each tool runs the CLI with `--json` and returns its output, so tools behave exa
 commands and fail with the same structured errors. `saba_logs` returns plain text, which is what
 a model reads best.
 
-Read-only tools are annotated as such. `saba_destroy` and `saba_db_restore` are marked
+Read-only tools are annotated as such. `saba_destroy` and `saba_restore` are marked
 destructive and refuse to run unless called with `confirm: true`, so an agent has to make that
 decision explicitly. Tool calls run concurrently, so an agent can check status while a deploy is
 in progress.

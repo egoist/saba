@@ -32,6 +32,8 @@ type RunOptions struct {
 	StopTimeout time.Duration
 	// ExtraHosts are "name:address" entries added to the container's /etc/hosts.
 	ExtraHosts []string
+	// Stdin, for RunOnce, is streamed to the container's standard input.
+	Stdin io.Reader
 }
 
 type BuildOptions struct {

@@ -173,7 +173,8 @@ daemon restarts and server reboots.
 Once a minute, at the top of the minute (UTC), the daemon:
 
 - starts due cron jobs (skipping a job whose previous run is still going),
-- starts due database backups,
+- starts due backups (database dumps run in the database's container; volume archives in a
+  short-lived busybox container that mounts the volumes next to the app, on its node),
 - makes sure the wanted wildcard certificates are managed (renewal itself runs inside
   CertMagic),
 - once an hour, uploads backups that exist only on the server to S3.

@@ -75,6 +75,9 @@ type Daemon struct {
 
 	cronMu      sync.Mutex
 	cronRunning map[string]bool
+
+	backupMu     sync.Mutex
+	backupFailed map[string]string // app → why its last scheduled backup failed
 }
 
 // Run starts the daemon and blocks until ctx is cancelled.
@@ -407,7 +410,19 @@ func (d *Daemon) cronLoop(ctx context.Context) {
 func (d *Daemon) runBackup(ctx context.Context, name string) {
 	bctx, cancel := context.WithTimeout(ctx, 6*time.Hour)
 	defer cancel()
-	if _, err := d.engine.Backup(bctx, name, "scheduled"); err != nil {
+	var req api.BackupRequest
+	if a, err := d.store.App(name); err == nil && a.Backup != nil {
+		req.Stop = a.Backup.Stop
+	}
+	_, err := d.engine.Backup(bctx, name, "scheduled", req)
+	d.backupMu.Lock()
+	defer d.backupMu.Unlock()
+	if d.backupFailed == nil {
+		d.backupFailed = map[string]string{}
+	}
+	delete(d.backupFailed, name)
+	if err != nil {
+		d.backupFailed[name] = err.Error()
 		d.log.Error("scheduled backup failed", "app", name, "err", err)
 	}
 }
